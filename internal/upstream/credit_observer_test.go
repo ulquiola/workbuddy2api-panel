@@ -107,3 +107,22 @@ func TestCreditObserverPanicIsContained(t *testing.T) {
 		t.Fatalf("remain=%d want 30", remain)
 	}
 }
+
+// 「积分构成」是按需打开的只读页面：它复用同一套解析，但不应把每次页面访问
+// 写进积分流水观察——余额留痕仍只由签到/后台刷新触发。
+func TestCreditPackagesDoesNotNotifyObserver(t *testing.T) {
+	payload := `{"code":0,"data":{"Response":{"Data":{"Accounts":[` +
+		`{"PackageName":"p","CycleCapacitySize":30,"CycleCapacityRemain":30,"CycleCapacityUsed":0}` +
+		`]}}}}`
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, payload), nil
+	})
+	n := 0
+	c.SetCreditObserver(func(string, int64) { n++ })
+	if _, _, _, err := c.CreditPackages(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
+		t.Fatalf("packages: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("CreditPackages 不应通知余额观察者，得到 %d 次", n)
+	}
+}

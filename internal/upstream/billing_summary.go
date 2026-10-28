@@ -21,8 +21,6 @@ package upstream
 
 import (
 	"encoding/json"
-	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -75,16 +73,21 @@ type summaryPackage struct {
 type packageDetail struct {
 	PackageCode         string    `json:"PackageCode"`
 	PackageName         string    `json:"PackageName"`
+	SubProductCode      string    `json:"SubProductCode"`
+	SubProductName      string    `json:"SubProductName"`
 	DeductionEndTime    int64     `json:"DeductionEndTime"` // epoch 毫秒，真实扣费截止
 	ExpiredTime         string    `json:"ExpiredTime"`
 	CycleEndTime        string    `json:"CycleEndTime"`
+	CreateTime          int64     `json:"CreateTime"` // epoch 毫秒，发放时刻
+	ResourceID          string    `json:"ResourceId"` // 单次发放的唯一标识（日赠包彼此不同）
 	CapacitySize        flexFloat `json:"CapacitySize"`
 	CapacityRemain      flexFloat `json:"CapacityRemain"`
 	CapacityUsed        flexFloat `json:"CapacityUsed"`
 	CycleCapacitySize   flexFloat `json:"CycleCapacitySize"`
 	CycleCapacityRemain flexFloat `json:"CycleCapacityRemain"`
 	CycleCapacityUsed   flexFloat `json:"CycleCapacityUsed"`
-	// *Precise 优先：整数形态会把 0.47 这类小数截断，两者都在时以 Precise 为准。
+	// *Precise 是上游的小数形态；逐包构成/批次沿用整数口径（与 CN
+	// get-user-resource、历史 CreditPackages 一致），字段保留供后续精确展示。
 	CapacitySizePrecise        flexFloat `json:"CapacitySizePrecise"`
 	CapacityRemainPrecise      flexFloat `json:"CapacityRemainPrecise"`
 	CycleCapacitySizePrecise   flexFloat `json:"CycleCapacitySizePrecise"`
@@ -103,112 +106,9 @@ type packagesReply struct {
 	TotalCount int             `json:"TotalCount"`
 }
 
-// globalUserResource 国际版额度查询：summary 给总额，paid/free 明细补到期批次。
-// 返回值口径与 CN 路径完全一致（remain/total/expiring/earliest/buckets），
-// 上游调用方无感知。
-func (c *Client) globalUserResource(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, buckets []ExpiryBucket, err error) {
-	var raw json.RawMessage
-	// summary 是主口径，失败即整次失败（明细单独拿到也没总额可对）。
-	raw, err = c.billingJSON(a, "POST", billingSummaryPath, map[string]any{})
-	if err != nil {
-		return 0, 0, 0, time.Time{}, 0, nil, err
-	}
-	var sum summaryReply
-	if uerr := json.Unmarshal(raw, &sum); uerr != nil {
-		return 0, 0, 0, time.Time{}, 0, nil, fmt.Errorf("billing summary parse: %w", uerr)
-	}
-	now := time.Now()
-	// summary 的 Packages 是「当前周期的权威用量」：remain/total 以它为准。
-	remainByCode := make(map[string]int64, len(sum.Packages))
-	for _, p := range sum.Packages {
-		r := int64(p.CycleRemainCapacity)
-		s := int64(p.CycleTotalCapacity)
-		if r < 0 {
-			r = 0
-		}
-		if r > s && s > 0 {
-			r = s
-		}
-		remain += r
-		total += s
-		if p.PackageCode != "" {
-			remainByCode[p.PackageCode] = r
-		}
-	}
-
-	// 明细只为「到期批次」服务：失败不影响总额（降级为无到期提醒）。
-	codes := make([]string, 0, len(sum.Packages))
-	for _, p := range sum.Packages {
-		if p.PackageCode != "" {
-			codes = append(codes, p.PackageCode)
-		}
-	}
-	details := c.globalPackageDetails(a, codes)
-	// 同一 PackageCode 在明细里会出现**多条**（每个计量周期一条：ResourceCycleId 不同、
-	// CycleEndTime 逐月递推）。按码归并——每个包只该贡献一次余额，且只认该码**最早
-	// 的未来到期**那条（真正会先扣完的那一期）。不归并会把同一笔余额重复计入 N 次，
-	// 面板「到期提醒」于是显示一堆同额批次。
-	type pick struct {
-		d   packageDetail
-		end time.Time
-	}
-	best := make(map[string]pick, len(details))
-	for _, d := range details {
-		end, ok := packageEndAt(d.DeductionEndTime, d.ExpiredTime, d.CycleEndTime)
-		if !ok || !end.After(now) {
-			continue
-		}
-		cur, seen := best[d.PackageCode]
-		if !seen || end.Before(cur.end) {
-			best[d.PackageCode] = pick{d: d, end: end}
-		}
-	}
-	byDate := make(map[string]*ExpiryBucket)
-	for code, p := range best {
-		d := p.d
-		r, ok := remainByCode[code]
-		if !ok {
-			// summary 没列这个包（已用完/过期/不同周期）→ 明细自报剩余，但仅在为正时计。
-			r = int64(d.balanceRemain())
-		}
-		if r <= 0 {
-			continue
-		}
-		end := p.end
-		if earliestAt.IsZero() || end.Before(earliestAt) {
-			earliestAt = end
-		}
-		day := end.In(softRateResetLoc).Format("2006-01-02")
-		b, seen := byDate[day]
-		if !seen {
-			b = &ExpiryBucket{Date: day, ExpireAt: end}
-			byDate[day] = b
-		} else if end.Before(b.ExpireAt) {
-			b.ExpireAt = end
-		}
-		b.Remain += r
-		if soon > 0 && !end.After(now.Add(soon)) {
-			expiring += r
-		}
-	}
-	dates := make([]string, 0, len(byDate))
-	for d := range byDate {
-		dates = append(dates, d)
-	}
-	sort.Strings(dates)
-	if len(dates) > 0 {
-		buckets = make([]ExpiryBucket, 0, len(dates))
-		for _, d := range dates {
-			buckets = append(buckets, *byDate[d])
-		}
-		earliestRemaining = buckets[0].Remain
-	}
-	c.notifyCredits(a, remain, nil)
-	return remain, total, expiring, earliestAt, earliestRemaining, buckets, nil
-}
-
-// globalPackageDetails 拉 paid + free 两份明细并合并。
-// 两条都失败 → nil（调用方降级为「无到期批次」）；一条失败只损失那一类的到期信息。
+// globalPackageDetails 拉 paid + free 两份明细并合并成统一行。
+// 返回成功拉取的端点数：0 表示两条都失败（调用方据此标注「积分构成」不可用），
+// 1 表示只拿到一类（另一类的到期信息缺失），2 表示完整。
 //
 // **两条端点的请求体不同形**（2026-10-20 双版本真机抓包实测，CN/GL 完全一致）：
 //
@@ -222,7 +122,7 @@ func (c *Client) globalUserResource(a *auth.Auth, soon time.Duration) (remain, t
 // `NeedRenewInfo` 是「是否要返回续订信息」的开关，paid 包靠它拿续订窗口。
 // PackageCodes 用 summary 已给的码缩小扫描范围（不按时间盲扫，避免漏包）；
 // Status [0,3] = 有效/已过期都要（过期包带权威 DeductionEndTime）。
-func (c *Client) globalPackageDetails(a *auth.Auth, codes []string) []packageDetail {
+func (c *Client) globalPackageDetails(a *auth.Auth, codes []string) ([]creditAccountRow, int) {
 	now := time.Now().In(softRateResetLoc)
 	paidBody := map[string]any{
 		"PageNumber":    1,
@@ -239,7 +139,8 @@ func (c *Client) globalPackageDetails(a *auth.Auth, codes []string) []packageDet
 		"SlicePeriodStartTime": cst.Day(now) + " 00:00:00",
 		"SlicePeriodEndTime":   cst.Day(now) + " 23:59:59",
 	}
-	var out []packageDetail
+	var out []creditAccountRow
+	ok := 0
 	for _, req := range []struct {
 		path string
 		body map[string]any
@@ -255,25 +156,32 @@ func (c *Client) globalPackageDetails(a *auth.Auth, codes []string) []packageDet
 		if json.Unmarshal(raw, &rep) != nil {
 			continue
 		}
-		out = append(out, rep.Accounts...)
+		ok++
+		for _, d := range rep.Accounts {
+			out = append(out, d.row())
+		}
 	}
-	return out
+	return out, ok
 }
 
-// balanceRemain 明细自报的剩余额度：Cycle 期套餐优先，回退整包容量；Precise 形态优先。
-func (d packageDetail) balanceRemain() float64 {
-	prefer := func(precise, plain, preciseCycle, plainCycle flexFloat) float64 {
-		if preciseCycle > 0 || plainCycle > 0 {
-			if preciseCycle > 0 {
-				return float64(preciseCycle)
-			}
-			return float64(plainCycle)
-		}
-		if precise > 0 {
-			return float64(precise)
-		}
-		return float64(plain)
+// row 把 global 明细行转成 CN/global 共用的规范化形态。
+// 容量字段保留整数口径（与 CN get-user-resource、历史 CreditPackages 一致）。
+func (d packageDetail) row() creditAccountRow {
+	return creditAccountRow{
+		PackageName:         d.PackageName,
+		PackageCode:         d.PackageCode,
+		SubProductCode:      d.SubProductCode,
+		SubProductName:      d.SubProductName,
+		DeductionEndTime:    d.DeductionEndTime,
+		ExpiredTime:         d.ExpiredTime,
+		CycleEndTime:        d.CycleEndTime,
+		CreateTime:          d.CreateTime,
+		ResourceID:          d.ResourceID,
+		CapacityRemain:      int64(d.CapacityRemain),
+		CapacityUsed:        int64(d.CapacityUsed),
+		CapacitySize:        int64(d.CapacitySize),
+		CycleCapacityRemain: int64(d.CycleCapacityRemain),
+		CycleCapacityUsed:   int64(d.CycleCapacityUsed),
+		CycleCapacitySize:   int64(d.CycleCapacitySize),
 	}
-	return prefer(d.CapacityRemainPrecise, d.CapacityRemain,
-		d.CycleCapacityRemainPrecise, d.CycleCapacityRemain)
 }

@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,8 +22,8 @@ import (
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
-	"github.com/misakano7545/workbuddy2api-panel/internal/loginsite"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/loginsite"
 	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
@@ -900,8 +899,8 @@ type CreditObserver func(uid string, credits int64)
 func New() *Client {
 	tr := newTransport()
 	c := &Client{
-		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		HTTP:     &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP: &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		// ChatBaseCN 取官方桌面端的 endpoint（product.json），不是备选入口
 		// copilot.tencent.com —— 后者是官方 NetworkFailover 里的备选，主入口才是
 		// www.workbuddy.cn。生产实测（同一账号）：/v3/config、billing 汇总、chat
@@ -1930,9 +1929,9 @@ type v3ModelPromotion struct {
 	// id+name+tags）。实测 2026-10-22：global 的 hy-image-3.5 只出现在这里、
 	// data.models 里没有——只按 models 解析会得出「国际版没有出图模型」的假
 	// 结论（实际可调：200 + usage{output_image_tokens:15000, credit:0.27}）。
-	ID   string   `json:"id"`
-	Name string   `json:"name"`
-	Tags []string `json:"tags"`
+	ID    string   `json:"id"`
+	Name  string   `json:"name"`
+	Tags  []string `json:"tags"`
 	Badge *struct {
 		Label string `json:"label"`
 	} `json:"badge"`
@@ -2401,8 +2400,8 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime / CycleEndTime
-	// 按优先级取首个有值字段）。
+	// EndTime 该包的真实到期时间（packageEndAt：DeductionEndTime 优先，回退
+	// ExpiredTime / CycleEndTime）。
 	EndTime string `json:"end_time,omitempty"`
 	// ExpiresAt 与 EndTime 同源的 Unix 毫秒时间戳，供面板按精确剩余天数聚合。
 	ExpiresAt int64 `json:"expires_at,omitempty"`
@@ -2421,95 +2420,19 @@ type CreditPackage struct {
 
 // CreditPackages 返回账号当前的逐包构成。remain/size 为各包求和。
 //
-// 字段选择与 UserResourceDetailed 的聚合口径一致：CycleCapacitySize > 0 时按
-// 周期字段算，否则按 Capacity 字段算——两条路径不能混，否则同一个包会被算两次。
+// 与到期批次共用 CreditSnapshot 的同一次解析：包的身份、到期时刻与剩余量只有
+// 一套算法，面板「积分构成」与「到期提醒」不会各说一个数。global 账号因此与
+// 余额刷新走同一套 summary+paid/free 请求（CN 仍是一条 get-user-resource）。
+// 页面访问不是余额观测：这里不通知余额观察者。
 func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, error) {
-	now := time.Now()
-	body := map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              "p_tcaca",
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
-	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	snap, err := c.creditSnapshot(a, 0, false)
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	// 注意层级：doJSON 已经解过 apiEnvelope 并返回 env.Data，所以这里从
-	// Response 开始解析——**不能**再套一层 Code/Data，否则 Accounts 恒为空，
-	// 表现为「每个号都 0 个包」（实测踩过）。
-	var resp struct {
-		Response struct {
-			Data struct {
-				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					// DeductionEndTime 真实扣费截止（epoch 毫秒）；CycleEndTime 只是
-					// 月度计量周期，套餐型包两者可差数年（见 packageEndAt 注释）。
-					DeductionEndTime int64  `json:"DeductionEndTime"`
-					ExpiredTime      string `json:"ExpiredTime"`
-					CycleEndTime     string `json:"CycleEndTime"`
-					// 发放时刻（epoch 毫秒）。
-					CreateTime     int64  `json:"CreateTime"`
-					PackageCode    string `json:"PackageCode"`
-					SubProductCode string `json:"SubProductCode"`
-					SubProductName string `json:"SubProductName"`
-				} `json:"Accounts"`
-			} `json:"Data"`
-		} `json:"Response"`
+	if snap.packagesErr != nil {
+		return nil, 0, 0, snap.packagesErr
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, 0, 0, fmt.Errorf("packages parse: %w", err)
-	}
-	packs := resp.Response.Data.Accounts
-	out := make([]CreditPackage, 0, len(packs))
-	var sumRemain, sumSize int64
-	for _, p := range packs {
-		cp := CreditPackage{
-			Name:           p.PackageName,
-			PackageCode:    p.PackageCode,
-			SubProductCode: p.SubProductCode,
-			SubProductName: p.SubProductName,
-		}
-		if end, ok := packageEndAt(p.DeductionEndTime, p.ExpiredTime, p.CycleEndTime); ok {
-			cp.EndTime = end.Format(packageEndLayout)
-			cp.ExpiresAt = end.UnixMilli()
-		}
-		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
-		if p.CreateTime > 0 {
-			cp.CreatedAt = time.UnixMilli(p.CreateTime).Format(time.RFC3339)
-		}
-		if p.CycleCapacitySize > 0 {
-			cp.Cycle = true
-			cp.Remain, cp.Size = p.CycleCapacityRemain, p.CycleCapacitySize
-			cp.Used = cp.Size - cp.Remain
-			if p.CycleCapacityUsed > cp.Used {
-				cp.Used = p.CycleCapacityUsed
-				cp.Remain = cp.Size - cp.Used
-			}
-			if cp.Remain < 0 {
-				cp.Remain = 0
-			}
-		} else {
-			cp.Remain, cp.Used, cp.Size = p.CapacityRemain, p.CapacityUsed, p.CapacitySize
-			if cp.Used == 0 && cp.Size > cp.Remain {
-				cp.Used = cp.Size - cp.Remain
-			}
-		}
-		sumRemain += cp.Remain
-		sumSize += cp.Size
-		out = append(out, cp)
-	}
-	// 面额降序：大包一眼可见，正是差异最可能出现的地方。
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Size > out[j].Size })
-	return out, sumRemain, sumSize, nil
+	return snap.Packages, snap.Remain, snap.Total, nil
 }
 
 func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
@@ -2565,9 +2488,8 @@ type ExpiryBucket struct {
 // （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
 // 恒 0（禁用分桶，行为与引入前一致）。expiring 是 remain 的一部分。
 //
-// 到期时间判据是 CycleEndTime（上游实测：CN/global 两域字段全集均无 PackageEndTime，
-// 旧判据恒 miss 致 expiring 恒 0；CycleEndTime 是上游真实下发的到期时刻——
-// global Bonus Pack 14 天赠送积分的到期时间即此字段）。解析失败/缺失的套餐保守
+// 到期时间判据是 packageEndAt（DeductionEndTime 优先——真实扣费截止；CycleEndTime
+// 只是月度计量周期，套餐型包两者可差数年）。解析失败/缺失的套餐保守
 // 不计入 expiring（不误标为快过期而插队）。
 // 单套餐取数统一调 packageRemainUsed（与 CreditPackages 同一事实来源，含 remain
 // 钳 [0,size] 与 used 修正；消除双份逻辑漂移——旧中间 switch 只钳负值，上游脏数据
@@ -2681,146 +2603,12 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 	return
 }
 
-// UserResourceSnapshot 在 UserResourceDetailedWithExpiry 基础上额外返回按自然日聚合的
-// 到期批次（buckets）。日期/剩余量口径与面板「积分构成」的逐包按日汇总完全一致，
-// 首页「到期提醒」快照据此可零上游请求渲染出与明细相同的内容——旧快照只存最早单批，
-// 同一天多个包会被少算，且扣穿第一批后整行消失。
-//
-// 到期时刻统一走 packageEndAt（DeductionEndTime 优先）。本函数此前只读 CycleEndTime，
-// 把套餐型包的月度周期重置日当成了到期日（实测：cycle=2026-10-31，deduction=2034-12-24），
-// 首页快照因此长期错报最近到期时间与数量。
+// UserResourceSnapshot 返回余额、快到期、最早批次与按自然日聚合的全部批次。
+// 与「积分构成」共用 CreditSnapshot：批次和逐包构成来自同一批 creditGrant，
+// 不再各自解析、各自聚合。
 func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, buckets []ExpiryBucket, err error) {
-	// 企业版与静态 API Key 的额度都不在「个人资源包」体系内：get-user-resource*
-	// 对 enterpriseId 非空账号恒返回空 Accounts（实测 code 0 且 Accounts null），
-	// 对 ck_/pt_ 静态 Key 同样（它没有个人账号身份）。判据收在
-	// auth.UsesEnterpriseBilling 一处，避免两个包各写一遍前缀判断。
-	if a.UsesEnterpriseBilling() {
-		remain, total, expiring, earliestAt, earliestRemaining, err = c.enterpriseResource(a, soon)
-		// 与个人路径同口径：企业额度查询是余额观察者（积分历史）唯一的企业入口——
-		// 企业号没有签到/任务，若此处不通知，它的余额变动将永远无迹可循。
-		c.notifyCredits(a, remain, err)
-		if err == nil && earliestRemaining > 0 && !earliestAt.IsZero() && earliestAt.After(time.Now()) {
-			buckets = []ExpiryBucket{{
-				Date:     earliestAt.In(softRateResetLoc).Format("2006-01-02"),
-				ExpireAt: earliestAt,
-				Remain:   earliestRemaining,
-			}}
-		}
-		return
-	}
-	// global realm 个人号：官方 5.8.4 国际版已改口径，走 summary + paid/free 明细
-	// （见 billing_summary.go）。继续用下面 CN 那套分页 body 打国际站，拿回的形态
-	// 与 CN 不同（无 Accounts 树、容量是字符串小数），会解出恒 0 余额 → 积分保底
-	// 把可用号当耗尽号挡出选号。summary 失败才回落到 CN 路径（老路径兼容尝试）。
-	if a.IsGlobal() {
-		rm, tt, ex, ea, er, bk, gerr := c.globalUserResource(a, soon)
-		if gerr == nil {
-			return rm, tt, ex, ea, er, bk, nil
-		}
-		log.Printf("WARN: billing %s: global summary 失败，回落个人资源包路径: %v",
-			logfmt.Label(a.UID, a.Nickname), gerr)
-	}
-	now := time.Now()
-	body := map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              "p_tcaca",
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
-	}
-	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500 会让
-	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
-	var data json.RawMessage
-	err = c.retryBillingTransient(func() error {
-		var e error
-		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
-		return e
-	})
-	if err != nil {
-		return 0, 0, 0, time.Time{}, 0, nil, err
-	}
-	var resp struct {
-		Response struct {
-			Data struct {
-				Accounts []struct {
-					PackageName string `json:"PackageName"`
-					// DeductionEndTime 真实扣费截止（epoch 毫秒）；CycleEndTime 只是
-					// 月度计量周期（见 packageEndAt 注释）。
-					DeductionEndTime    int64  `json:"DeductionEndTime"`
-					ExpiredTime         string `json:"ExpiredTime"`
-					CycleEndTime        string `json:"CycleEndTime"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
-			} `json:"Data"`
-		} `json:"Response"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, time.Time{}, 0, nil, fmt.Errorf("resource parse: %w", err)
-	}
-	byDate := make(map[string]*ExpiryBucket)
-	for _, acct := range resp.Response.Data.Accounts {
-		r, _, size := packageRemainUsed(respAccount{
-			CapacityRemain:      acct.CapacityRemain,
-			CapacityUsed:        acct.CapacityUsed,
-			CapacitySize:        acct.CapacitySize,
-			CycleCapacityRemain: acct.CycleCapacityRemain,
-			CycleCapacityUsed:   acct.CycleCapacityUsed,
-			CycleCapacitySize:   acct.CycleCapacitySize,
-		})
-		if r < 0 {
-			r = 0
-		}
-		if size < r {
-			size = r
-		}
-		remain += r
-		total += size
-		if r <= 0 {
-			continue
-		}
-		end, ok := packageEndAt(acct.DeductionEndTime, acct.ExpiredTime, acct.CycleEndTime)
-		if !ok || !end.After(now) {
-			continue
-		}
-		if earliestAt.IsZero() || end.Before(earliestAt) {
-			earliestAt = end
-		}
-		// 按自然日（UTC+8）聚合：与 CreditPackages → 前端 end_time.slice(0,10) 同口径。
-		day := end.In(softRateResetLoc).Format("2006-01-02")
-		b, seen := byDate[day]
-		if !seen {
-			b = &ExpiryBucket{Date: day, ExpireAt: end}
-			byDate[day] = b
-		} else if end.Before(b.ExpireAt) {
-			b.ExpireAt = end
-		}
-		b.Remain += r
-		// 分桶：仅 soon>0 且确实在窗口内 → expiring。
-		if soon > 0 && !end.After(now.Add(soon)) {
-			expiring += r
-		}
-	}
-	dates := make([]string, 0, len(byDate))
-	for d := range byDate {
-		dates = append(dates, d)
-	}
-	sort.Strings(dates)
-	buckets = make([]ExpiryBucket, 0, len(dates))
-	for _, d := range dates {
-		buckets = append(buckets, *byDate[d])
-	}
-	// earliestRemaining 是该自然日全部正余额包的合计（不是单个包的剩余量）。
-	if len(buckets) > 0 {
-		earliestRemaining = buckets[0].Remain
-	}
-	c.notifyCredits(a, remain, nil)
-	return remain, total, expiring, earliestAt, earliestRemaining, buckets, nil
+	snap, err := c.CreditSnapshot(a, soon)
+	return snap.Remain, snap.Total, snap.Expiring, snap.EarliestAt, snap.EarliestRemaining, snap.Buckets, err
 }
 
 // SetCreditObserver 挂载/注销（nil）余额观察者。可在启动后任意时刻调用；
