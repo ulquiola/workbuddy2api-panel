@@ -25,6 +25,7 @@ __pycache__/
 backups/
 
 # IDE
+.DS_Store
 .idea/
 .vscode/
 LOOP.md
