@@ -3614,8 +3614,44 @@ function expDayDiff(dateStr) {
   return Math.round((ms - base) / PK_DAY_MS);
 }
 
+// expDateLabel 后续批次/长期包的日期：同年只显示 MM-DD，跨年显示完整日期。
+// 旧实现一律 slice(5)，把 2034-12-15 显示成「12-15」，看起来像两个月后到期。
+function expDateLabel(date) {
+  const today = expCSTDate(Date.now());
+  return date && date.slice(0, 4) === today.slice(0, 4) ? date.slice(5) : date;
+}
+
+// expDaysLabel 距到期文案：超过 90 天不再显示「3002 天」，标成「长期」。
+function expDaysLabel(days) {
+  if (days > 90) return '长期';
+  if (days === 0) return '今天';
+  if (days === 1) return '明天';
+  return days + ' 天';
+}
+
+// expWaste 按 FEFO 估算未来 horizon 天内会浪费多少积分。
+//
+// 按到期日从近到远扣减：到第 d 天时最多已消耗 burn×d（今天按 1 天算），
+// 先扣最早到期的批次；某批到期时还没被扣完的部分就是预计浪费。burn 取近 7 天
+// 实际扣分均值——它回答的是「按现在的用法会不会浪费」，不是「每天必须烧多少」。
+function expWaste(bs, burnPerDay, horizon) {
+  const burn = Math.max(0, Number(burnPerDay) || 0);
+  let consumed = 0, waste = 0;
+  for (const b of bs) {
+    const days = expDayDiff(b.date);
+    if (days === null || days < 0 || days > horizon) continue;
+    const remain = Math.max(0, Number(b.remain) || 0);
+    const capacity = burn * Math.max(1, days);
+    const use = Math.max(0, Math.min(remain, capacity - consumed));
+    waste += remain - use;
+    consumed += use;
+  }
+  return waste;
+}
+
 function renderExpirySnapshot(d) {
   const rows = [];
+  const burnMap = (d && d.credit_burn_7d) || {};
   for (const a of (d && d.accounts) || []) {
     const bs = expBucketList(a).filter(b => {
       const days = expDayDiff(b.date);
@@ -3635,28 +3671,35 @@ function renderExpirySnapshot(d) {
   const rowOf = ({ a, bs }, hidden) => {
     const first = bs[0];
     const days = expDayDiff(first.date);
-    const daily = Math.ceil(first.remain / Math.max(1, days));
     const week = bs.filter(b => expDayDiff(b.date) <= 7).reduce((s, b) => s + b.remain, 0);
+    const burn = burnMap[String(a.uid || '')];
+    const burnPerDay = burn && Number(burn.samples) > 0 ? Number(burn.credits || 0) / 7 : null;
+    const waste = burnPerDay === null ? null : Math.ceil(expWaste(bs, burnPerDay, 7));
     const color = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
-    const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
+    const wasteColor = waste > 0 ? 'var(--bad)' : 'var(--ok)';
+    const more = bs.length > 4 ? '　共 ' + bs.length + ' 批' : '';
     const rest = bs.slice(1, 4).map(b =>
-      '随后 ' + esc(b.date.slice(5)) + ' · ' + fmtTok(b.remain)).join('　') + more;
+      '随后 ' + esc(expDateLabel(b.date)) + ' · ' + fmtTok(b.remain)).join('　') + more;
+    const longTerm = bs.find(b => expDayDiff(b.date) > 90);
     const sub = (rest ? '<div class="note">' + rest + '</div>' : '') +
-      (week > first.remain ? '<div class="note">7 天内合计 ' + fmtTok(week) + '</div>' : '');
+      (longTerm ? '<div class="note">长期 ' + esc(expDateLabel(longTerm.date)) +
+        ' · ' + fmtTok(longTerm.remain) + '</div>' : '');
+    const burnText = burnPerDay === null ? '无近期样本' : fmtTok(Math.round(burnPerDay)) + '/天';
     return '<tr' + (hidden ? ' data-exp-row="rest" hidden' : '') + '>' +
       '<td>' + esc(acctName(a)) + '</td>' +
       '<td>' + esc(first.date) + sub + '</td>' +
-      '<td class="num" style="color:' + color + '">' +
-        (days === 0 ? '今天' : days === 1 ? '明天' : days + ' 天') + '</td>' +
-      '<td class="num">' + fmtTok(first.remain) + '</td>' +
-      '<td class="num">' + fmtTok(daily) + '</td>' +
+      '<td class="num" style="color:' + color + '">' + expDaysLabel(days) + '</td>' +
+      '<td class="num">' + fmtTok(week) + '</td>' +
+      '<td class="num">' + burnText + '</td>' +
+      '<td class="num"' + (waste === null ? '' : ' style="color:' + wasteColor + '"') + '>' +
+        (waste === null ? '—' : fmtTok(waste)) + '</td>' +
       '</tr>';
   };
   // 收纳行沿用「积分构成」页的分组行样式（pk-group-summary / pk-group-toggle）。
   const rest = rows.slice(EXP_HEAD);
-  $('expBody').innerHTML = !rows.length ? '<tr><td colspan="5">暂无未来到期批次</td></tr>'
+  $('expBody').innerHTML = !rows.length ? '<tr><td colspan="6">暂无未来到期批次</td></tr>'
     : rows.slice(0, EXP_HEAD).map(r => rowOf(r, false)).join('') +
-      (rest.length ? '<tr class="pk-group-summary"><td colspan="5">' +
+      (rest.length ? '<tr class="pk-group-summary"><td colspan="6">' +
         '<button type="button" class="pk-group-toggle" data-exp-rest="' + rest.length +
         '" aria-expanded="false">其余 ' + rest.length + ' 个账号，展开</button></td></tr>' +
         rest.map(r => rowOf(r, true)).join('') : '');

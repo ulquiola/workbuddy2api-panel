@@ -596,6 +596,61 @@ func (r *Recorder) SnapshotWithRates(hours int, nicks map[string]string, current
 	return r.SnapshotWindow(Window{Hours: hours}, nicks, currentRate)
 }
 
+// CreditBurn 窗口内某账号的实测积分消耗。
+//
+// Credits 是上游 usage.credit 的累计；Samples 是拿到 credit 样本的请求数。
+// 样本为 0 表示「没观测到扣分」，与「观测到 0 分」不同——面板据此区分
+// 「无近期消耗样本」和「实际消耗 0/天」。
+type CreditBurn struct {
+	Credits float64 `json:"credits"`
+	Samples int64   `json:"samples"`
+}
+
+// CreditByAccountWindow 按窗口聚合每账号的实测扣费积分。
+//
+// 只做一次分片遍历求和，不构建 Snapshot 的其它维度；overview 每 5 秒调用一次
+// 也不会把按模型/时序的聚合白白算一遍。窗口语义与 SnapshotWindow 完全一致。
+func (r *Recorder) CreditByAccountWindow(w Window) map[string]CreditBurn {
+	if r == nil {
+		return nil
+	}
+	from, to := w.bounds()
+	r.mu.Lock()
+	bs := make([]bucket, 0, len(r.buckets))
+	for _, b := range r.buckets {
+		bs = append(bs, *b)
+	}
+	r.mu.Unlock()
+
+	out := make(map[string]CreditBurn)
+	for i := range bs {
+		b := &bs[i]
+		if b.UID == "" {
+			continue
+		}
+		if !from.IsZero() || !to.IsZero() {
+			ts, ok := bucketTime(b.Scope)
+			if !ok {
+				continue
+			}
+			if !from.IsZero() && ts.Before(from) {
+				continue
+			}
+			if !to.IsZero() && ts.After(to) {
+				continue
+			}
+		}
+		if b.CRN == 0 {
+			continue // 没有扣分样本：不进入 map（「没测到」≠「花了 0」）
+		}
+		cb := out[b.UID]
+		cb.Credits += b.CR
+		cb.Samples += b.CRN
+		out[b.UID] = cb
+	}
+	return out
+}
+
 // SnapshotWindow 聚合**所选窗口内**的桶，产出面板一次拉取的全部用量视图数据。
 //
 // 窗口语义见 Window：滚动窗口（Hours）/ 显式区间（From-To）/ 全部历史。卡片汇总、

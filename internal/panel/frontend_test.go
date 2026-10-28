@@ -1551,7 +1551,10 @@ vm.createContext(ctx);
 vm.runInContext("'use strict';\n" + 'const restOpen = Object.create(null);\n' +
   src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
 const day = n => new Date(Date.now() + n * 86400000).toISOString();
-ctx.renderExpirySnapshot({ accounts: [
+ctx.renderExpirySnapshot({ credit_burn_7d: {
+  'aaaaaaaa-1': { credits: 70, samples: 10 },
+  'bbbbbbbb-2': { credits: 0, samples: 10 },
+}, accounts: [
   { uid: 'aaaaaaaa-1', nickname: '秋',     credits_earliest_expiry: day(20), credits_earliest_remaining: 499 },
   { uid: 'bbbbbbbb-2', nickname: '秋千易', credits_earliest_expiry: day(2),  credits_earliest_remaining: 41 },
   { uid: 'cccccccc-3', nickname: '长期包', credits_earliest_expiry: null,   credits_earliest_remaining: 0 },
@@ -1568,7 +1571,7 @@ ctx.renderExpirySnapshot({ accounts: [1,2,3,4,5].map(n => ({ uid: 'u' + n, nickn
   credits_earliest_expiry: day(n), credits_earliest_remaining: 10 * n })) });
 const html2 = els['expBody'].innerHTML;
 process.stdout.write(JSON.stringify({
-  rows: rows.map(c => [c[0], c[2], c[3], c[4]]),
+  rows: rows.map(c => [c[0], c[2], c[3], c[4], c[5]]),
   note: note,
   head: cells(html2.split('<tr class="pk-group-summary"')[0]).map(c => [c[0], c[2]]),
   restHidden: (html2.match(/<tr data-exp-row="rest" hidden>/g) || []).length,
@@ -1586,9 +1589,9 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("expiry snapshot node test failed: %v\n%s", err, out)
 	}
-	// 41 分 2 天后到期 → 日均需耗 21（ceil 20.5）；499 分 20 天 → 25（ceil 24.95）。
-	// 若把 ceil 改成 floor，这里必须变成 20 / 24。
-	want := `{"rows":[["秋千易","2 天","41","21"],["秋","20 天","499","25"]],` +
+	// 秋千易：2 天后 41 分、近 7 天 0/天 → 7 天浪费 41；秋：20 天后 499 分、
+	// 7 天内无到期 → 浪费 0（10 天/天只用于展示，不改变 499 的长期归属）。
+	want := `{"rows":[["秋千易","2 天","41","0/天","41"],["秋","20 天","0","10/天","0"]],` +
 		`"note":` + strconv.Quote("2 个账号有未到期批次 · 未开启后台刷新 · 明细见「积分构成」") + `,` +
 		// 收纳：只展开最近到期的 3 个（A1/A2/A3 按到期升序），其余 2 个 hidden。
 		`"head":[["A1","明天"],["A2","2 天"],["A3","3 天"]],"restHidden":2,"label":"其余 2 个账号，展开"}`
@@ -1878,7 +1881,7 @@ ctx.renderExpirySnapshot({
 process.stdout.write(JSON.stringify({
   order: buckets.html.indexOf('>A<') >= 0 && buckets.html.indexOf('>A<') < buckets.html.indexOf('>B<'),
   hasRest: buckets.html.includes('随后'),
-  weekSum: buckets.html.includes('7 天内合计 420'),
+  weekSum: buckets.html.includes('>420<'),
   dayLabel: buckets.html.includes('3 天'),
   note: buckets.note,
   fallback: ctx.expBody.innerHTML.includes('77'),
@@ -2058,5 +2061,83 @@ func TestAppJSAllCalledFunctionsDefined(t *testing.T) {
 			t.Errorf("app.js 调用了 %s() 但本文件里没有定义（调用 %d 次）—— 典型成因：搬代码时漏搬底层工具函数；"+
 				"运行时会在调用点抛 ReferenceError，若被 try/catch 吞掉则表现为「页面空白但无报错」", name, missing[name])
 		}
+	}
+}
+
+// TestAppJSExpiryWasteAndLongTerm 到期提醒的浪费估算与长期包展示：
+//   - 近 7 天 0 消耗 → 7 天内到期的积分全部计为预计浪费；
+//   - 消耗速度足以覆盖到期量 → 浪费为 0（不能简单用「到期量 - 消耗量」算负数）；
+//   - 没有扣分样本 → 显示「无近期样本」而不是伪造 0；
+//   - 超过 90 天的批次标「长期」，跨年日期不能截成 MM-DD。
+func TestAppJSExpiryWasteAndLongTerm(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry waste test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expCSTDate');
+const end = src.indexOf('// 收纳行展开/收起');
+if (start < 0 || end < 0) throw new Error('expiry helpers not found');
+const ctx = { acctName: a => String(a.uid), aliasForUid: () => '',
+  Number, String, Array, Date, Math, JSON, PK_DAY_MS: 86400000,
+  expBody: { innerHTML: '', querySelector: () => null }, expNote: { textContent: '' },
+  esc: s => String(s), fmtTok: n => String(n),
+  pkExpiryDateTime: ms => new Date(ms).toISOString(),
+};
+ctx.$ = id => ctx[id];
+vm.createContext(ctx);
+vm.runInContext("'use strict';\n" + 'const restOpen = Object.create(null);\n' +
+  src.slice(start, end) + '\nthis.renderExpirySnapshot=renderExpirySnapshot;', ctx);
+const day = n => {
+  const d = new Date(Date.now() + n * 86400000);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(d);
+  const p = t => (parts.find(x => x.type === t) || {}).value;
+  return p('year') + '-' + p('month') + '-' + p('day');
+};
+const bs = [{ date: day(1), remain: 30 }, { date: day(3), remain: 30 }, { date: day(5), remain: 30 }];
+ctx.renderExpirySnapshot({
+  credit_burn_7d: {
+    u0: { credits: 0, samples: 10 },
+    u1: { credits: 700, samples: 10 },
+  },
+  accounts: [
+    { uid: 'u0', credits_expiry_buckets: bs },
+    { uid: 'u1', credits_expiry_buckets: bs },
+    { uid: 'u2', credits_expiry_buckets: bs },
+    { uid: 'u3', credits_expiry_buckets: [{ date: day(400), remain: 100 }] },
+  ],
+});
+const rows = [...ctx.expBody.innerHTML.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)]
+  .map(m => m[1])
+  .filter(r => !r.includes('pk-group-toggle'))
+  .map(r => [...r.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)]
+    .map(m => m[1].replace(/<[^>]*>/g, '')));
+process.stdout.write(JSON.stringify({
+  zeroBurn: [rows[0][3], rows[0][4], rows[0][5]],
+  covered: [rows[1][3], rows[1][4], rows[1][5]],
+  noSamples: [rows[2][4], rows[2][5]],
+  longTerm: [rows[3][2], rows[3][3]],
+  longLabel: ctx.expBody.innerHTML.includes('长期 ' + day(400)),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "expiry-waste-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry waste node test failed: %v\n%s", err, out)
+	}
+	const want = `{"zeroBurn":["90","0/天","90"],"covered":["90","100/天","0"],` +
+		`"noSamples":["无近期样本","—"],"longTerm":["长期","0"],"longLabel":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("到期浪费估算不符:\n got=%s\nwant=%s", strings.TrimSpace(string(out)), want)
 	}
 }

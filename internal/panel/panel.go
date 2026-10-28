@@ -124,6 +124,13 @@ type Panel struct {
 	modelsCacheAt time.Time
 	modelsCache   *modelsCacheEntry
 
+	// burnMu/burnCache* credit_burn_7d 的短 TTL 缓存：overview 是 5 秒轮询，
+	// 但近 7 天消耗是分钟级变化的指标——30 秒内直接复用，避免每次轮询都复制
+	// 一遍用量分片。
+	burnMu    sync.Mutex
+	burnAt    time.Time
+	burnCache map[string]usage.CreditBurn
+
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
@@ -369,7 +376,26 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
 		"balance_refresh_sec":  p.balanceRefreshSec(),
 		"balance_refreshed_at": p.balanceRefreshedAt(),
+		// 近 7 天每账号实测扣分：到期提醒据此估算「按当前消耗速度会用掉多少、
+		// 可能浪费多少」。没有样本的账号不出现在 map 里，前端显示「无近期消耗样本」。
+		"credit_burn_7d": p.creditBurn7d(),
 	})
+}
+
+// creditBurn7d 近 7 天每账号实测扣分（上游 usage.credit 累计）。
+// 纯内存聚合，不额外请求上游；用量记录器缺失时返回 nil。
+func (p *Panel) creditBurn7d() map[string]usage.CreditBurn {
+	if p.cfg.Usage == nil {
+		return nil
+	}
+	p.burnMu.Lock()
+	defer p.burnMu.Unlock()
+	if p.burnCache != nil && time.Since(p.burnAt) < 30*time.Second {
+		return p.burnCache
+	}
+	p.burnCache = p.cfg.Usage.CreditByAccountWindow(usage.Window{Hours: 7 * 24})
+	p.burnAt = time.Now()
+	return p.burnCache
 }
 
 // balanceRefreshSec 余额后台刷新间隔（秒）；无调度器/未开启时为 0。

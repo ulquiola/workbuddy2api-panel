@@ -835,10 +835,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <!-- 到期提醒：数据取 /overview 的 credits_expiry_buckets（签到与余额后台刷新
            按自然日聚合后写入 state.json），打开页面零上游请求。同日多个包合并为一行，
-           后续批次在日期下方列出；完整逐包明细在「积分构成」页。 -->
+           后续批次在日期下方列出；完整逐包明细在「积分构成」页。credit_burn_7d
+           提供近 7 天实测扣分，用于估算「按当前速度会用掉多少、可能浪费多少」。 -->
       <div class="box">
         <header>
-          <h3>积分到期提醒 <span class="hint">按自然日聚合 · 日均需耗 = 该日到期积分 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
+          <h3>积分到期提醒 <span class="hint">按自然日聚合 · 未来 7 天到期 = 7 天内失效的积分 · 预计浪费 = 按近 7 天实际扣分速度、失效前用不掉的部分（FEFO 估算）</span></h3>
           <span class="grow"></span>
           <span class="note" id="expNote"></span>
         </header>
@@ -846,7 +847,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <table class="acc">
           <thead><tr>
             <th>账号</th><th>最近到期</th><th class="num">距到期</th>
-            <th class="num">该日到期</th><th class="num">日均需耗</th>
+            <th class="num">未来 7 天到期</th><th class="num">近 7 天日均</th>
+            <th class="num">预计 7 天浪费</th>
           </tr></thead>
           <tbody id="expBody"></tbody>
         </table>
