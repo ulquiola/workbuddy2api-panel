@@ -51,12 +51,14 @@ type Settings struct {
 
 // Status is safe to expose through the authenticated panel API.
 type Status struct {
-	CurrentVersion  string `json:"current_version"`
-	LatestVersion   string `json:"latest_version"`
-	ReleaseURL      string `json:"release_url"`
-	ReleaseNotes    string `json:"release_notes"`
-	CheckedAt       string `json:"checked_at"`
-	LastError       string `json:"last_error"`
+	CurrentVersion string `json:"current_version"`
+	LatestVersion  string `json:"latest_version"`
+	ReleaseURL     string `json:"release_url"`
+	ReleaseNotes   string `json:"release_notes"`
+	CheckedAt      string `json:"checked_at"`
+	LastError      string `json:"last_error"`
+	// Note 非错误的检查提示（如仓库暂无 Release）：面板按提示展示，不显示成「更新失败」。
+	Note            string `json:"note,omitempty"`
 	UpdateAvailable bool   `json:"update_available"`
 	CanInstall      bool   `json:"can_install"`
 	Installing      bool   `json:"installing"`
@@ -114,7 +116,7 @@ func New(version, repository, configPath string, settings Settings) *Manager {
 		executable = resolved
 	}
 	if repository == "" {
-		repository = "misakano7545/workbuddy2api-panel"
+		repository = "ulquiola/workbuddy2api-panel"
 	}
 	if settings.AutoTime == "" {
 		settings.AutoTime = "04:00"
@@ -223,7 +225,20 @@ func (m *Manager) Check(ctx context.Context) error {
 			}
 		}
 		if newest == nil {
-			err = errors.New("没有找到时间版本格式的正式 Release")
+			// 仓库还没有时间版本 Release（新 fork 的常态）：不是错误，给一条提示，
+			// 避免面板把「尚未发布」显示成「更新失败」。
+			m.mu.Lock()
+			m.status.LatestVersion = ""
+			m.status.ReleaseURL = ""
+			m.status.ReleaseNotes = ""
+			m.status.UpdateAvailable = false
+			m.status.CanInstall = m.canInstallLocked()
+			m.status.LastError = ""
+			m.status.Note = "仓库暂无 Release；发布后会自动检查"
+			m.status.CheckedAt = m.now().Format(time.RFC3339)
+			m.lastCheck = m.now()
+			m.mu.Unlock()
+			return nil
 		} else {
 			releaseURL := ""
 			if releaseLink, parseErr := url.Parse(newest.HTMLURL); parseErr == nil && isTrustedGitHubURL(releaseLink, true) {
@@ -238,6 +253,7 @@ func (m *Manager) Check(ctx context.Context) error {
 			m.status.UpdateAvailable = !currentOK || newestVersion.ordinal > current.ordinal
 			m.status.CanInstall = m.canInstallLocked()
 			m.status.LastError = ""
+			m.status.Note = ""
 			m.status.CheckedAt = m.now().Format(time.RFC3339)
 			m.lastCheck = m.now()
 			m.mu.Unlock()
@@ -247,6 +263,7 @@ func (m *Manager) Check(ctx context.Context) error {
 
 	m.mu.Lock()
 	m.status.LastError = err.Error()
+	m.status.Note = ""
 	m.status.CheckedAt = m.now().Format(time.RFC3339)
 	m.lastCheck = m.now()
 	m.mu.Unlock()

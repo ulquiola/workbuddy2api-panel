@@ -286,3 +286,26 @@ func TestDownloadRejectsExternalRedirectAndWrongSize(t *testing.T) {
 		t.Fatal("non-hex digest accepted")
 	}
 }
+
+// TestCheckNoTimestampedReleaseIsNotAnError 仓库还没有时间版本 Release 时，
+// 这是一条提示而不是错误：面板应显示「仓库暂无 Release」，不能显示「更新失败」。
+func TestCheckNoTimestampedReleaseIsNotAnError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/example/project/releases" {
+			t.Fatalf("unexpected request path %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`[{"tag_name":"v1.2.3","draft":false,"prerelease":false}]`))
+	}))
+	defer server.Close()
+
+	m := New("2026.10.28.1937", "example/project", "", Settings{})
+	m.apiBaseURL = server.URL
+	m.now = func() time.Time { return time.Date(2026, 10, 28, 19, 40, 0, 0, time.FixedZone("CST", 8*3600)) }
+	if err := m.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := m.Status()
+	if got.UpdateAvailable || got.LatestVersion != "" || got.LastError != "" || got.Note == "" {
+		t.Fatalf("unexpected status: %+v", got)
+	}
+}

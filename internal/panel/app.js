@@ -643,6 +643,8 @@ function renderUpdateStatus(update) {
     note.textContent = '正在准备更新…';
   } else if (update.last_error) {
     note.textContent = '更新失败：' + update.last_error;
+  } else if (update.note) {
+    note.textContent = update.note;
   } else if (update.update_available) {
     note.textContent = '发现新版本 v' + update.latest_version + (update.can_install ? '' : ' · 请手动更新');
   } else if (update.latest_version) {
