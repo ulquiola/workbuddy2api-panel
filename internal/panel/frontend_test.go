@@ -1561,20 +1561,27 @@ ctx.renderExpirySnapshot({ credit_burn_7d: {
   { uid: 'dddddddd-4', nickname: '零批次', credits_earliest_expiry: day(5), credits_earliest_remaining: 0 },
 ]});
 const html = els['expBody'].innerHTML;
-const cells = h => h.split('<tr>').slice(1).map(r =>
-  [...r.matchAll(/<td[^>]*>([^<]*)<\/td>/g)].map(m => m[1]));
-const rows = cells(html);
+const rowsOf = h => h.split('<div class="exp-row"').slice(1).map(seg => {
+  const nm = (seg.match(/class="nm">([^<]*)</) || ['', ''])[1];
+  const rel = (seg.match(/class="exp-nearest">[\s\S]*?class="rel">([^<]*)</) || ['', ''])[1];
+  const stats = [...seg.matchAll(/class="exp-stat[^"]*"><div class="k">[^<]*<\/div><div class="v">([^<]*)<\/div>/g)]
+    .map(m => m[1]);
+  return [nm, rel, ...stats];
+});
+const rows = rowsOf(html);
 const note = els['expNote'].textContent;   // 两次渲染前先取，下同
+const hero = els['expHero'].innerHTML;
 
 // 5 个将到期账号 → 只展开最近 3 个，其余 2 个收纳成一行且默认收起。
 ctx.renderExpirySnapshot({ accounts: [1,2,3,4,5].map(n => ({ uid: 'u' + n, nickname: 'A' + n,
   credits_earliest_expiry: day(n), credits_earliest_remaining: 10 * n })) });
 const html2 = els['expBody'].innerHTML;
 process.stdout.write(JSON.stringify({
-  rows: rows.map(c => [c[0], c[2], c[3], c[4], c[5]]),
+  rows: rows.map(c => [c[0], c[1], c[2], c[3], c[4]]),
   note: note,
-  head: cells(html2.split('<tr class="pk-group-summary"')[0]).map(c => [c[0], c[2]]),
-  restHidden: (html2.match(/<tr data-exp-row="rest" hidden>/g) || []).length,
+  heroOk: hero.includes('秋千易') && hero.includes('>41<') && hero.includes('2 天'),
+  head: rowsOf(html2.split('<div class="exp-rest"')[0]).slice(0, 3).map(c => [c[0], c[1]]),
+  restHidden: (html2.match(/data-exp-row="rest" hidden/g) || []).length,
   label: (html2.match(/data-exp-rest="\d+"[^>]*>([^<]+)</) || ['', ''])[1],
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "expsnap-*.cjs")
@@ -1593,6 +1600,7 @@ process.stdout.write(JSON.stringify({
 	// 7 天内无到期 → 浪费 0（10 天/天只用于展示，不改变 499 的长期归属）。
 	want := `{"rows":[["秋千易","2 天","41","0/天","41"],["秋","20 天","0","10/天","0"]],` +
 		`"note":` + strconv.Quote("2 个账号有未到期批次 · 未开启后台刷新 · 明细见「积分构成」") + `,` +
+		`"heroOk":true,` +
 		// 收纳：只展开最近到期的 3 个（A1/A2/A3 按到期升序），其余 2 个 hidden。
 		`"head":[["A1","明天"],["A2","2 天"],["A3","3 天"]],"restHidden":2,"label":"其余 2 个账号，展开"}`
 	if strings.TrimSpace(string(out)) != want {
@@ -1681,7 +1689,7 @@ func TestAppJSExpiryRestToggleSurvivesRerender(t *testing.T) {
 	script := `const fs = require('fs');
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
-const start = src.indexOf('// 按 restOpen 把指定 tbody 的收纳行');
+const start = src.indexOf('// 按 restOpen 把指定容器的收纳行');
 const end = src.indexOf("bindRestToggle('expBody');") + "bindRestToggle('expBody');".length;
 if (start < 0 || end < 0) throw new Error('rest toggle block not found');
 
@@ -1691,7 +1699,7 @@ function makeBody(n) {
     rows: [], btn: null, handlers: {},
     addEventListener(ev, fn) { this.handlers[ev] = fn; },
     querySelector(sel) { return sel === 'button[data-exp-rest]' ? this.btn : null; },
-    querySelectorAll(sel) { return sel === 'tr[data-exp-row="rest"]' ? this.rows : []; },
+    querySelectorAll(sel) { return sel === '[data-exp-row="rest"]' ? this.rows : []; },
   };
   reset(o, n);
   return o;
@@ -1830,7 +1838,7 @@ process.stdout.write(JSON.stringify({
 }
 
 // TestAppJSExpirySnapshotBuckets 到期提醒快照必须消费 credits_expiry_buckets：
-// 同日多包取聚合后的该日合计、后续批次列在日期下方、7 天内合计可读、排序稳定，
+// 同日多包取聚合后的该日合计、后续批次用迷你条展示、7 天内合计可读、排序稳定，
 // 并在旧 state 无 buckets 时退回最早一批兜底。节奏标注必须来自 overview 的
 // balance_refresh_sec/balance_refreshed_at，而不是界面轮询间隔。
 func TestAppJSExpirySnapshotBuckets(t *testing.T) {
@@ -1880,7 +1888,7 @@ ctx.renderExpirySnapshot({
 });
 process.stdout.write(JSON.stringify({
   order: buckets.html.indexOf('>A<') >= 0 && buckets.html.indexOf('>A<') < buckets.html.indexOf('>B<'),
-  hasRest: buckets.html.includes('随后'),
+  hasRest: buckets.html.includes('exp-bars') && buckets.html.includes('共 '),
   weekSum: buckets.html.includes('>420<'),
   dayLabel: buckets.html.includes('3 天'),
   note: buckets.note,
@@ -2111,17 +2119,18 @@ ctx.renderExpirySnapshot({
     { uid: 'u3', credits_expiry_buckets: [{ date: day(400), remain: 100 }] },
   ],
 });
-const rows = [...ctx.expBody.innerHTML.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)]
-  .map(m => m[1])
-  .filter(r => !r.includes('pk-group-toggle'))
-  .map(r => [...r.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)]
-    .map(m => m[1].replace(/<[^>]*>/g, '')));
+const rows = ctx.expBody.innerHTML.split('<div class="exp-row"').slice(1).map(seg => {
+  const rel = (seg.match(/class="exp-nearest">[\s\S]*?class="rel">([^<]*)</) || ['', ''])[1];
+  const stats = [...seg.matchAll(/class="exp-stat[^"]*"><div class="k">[^<]*<\/div><div class="v">([^<]*)<\/div>/g)]
+    .map(m => m[1]);
+  return { rel, stats };
+});
 process.stdout.write(JSON.stringify({
-  zeroBurn: [rows[0][3], rows[0][4], rows[0][5]],
-  covered: [rows[1][3], rows[1][4], rows[1][5]],
-  noSamples: [rows[2][4], rows[2][5]],
-  longTerm: [rows[3][2], rows[3][3]],
-  longLabel: ctx.expBody.innerHTML.includes('长期 ' + day(400)),
+  zeroBurn: rows[0].stats,
+  covered: rows[1].stats,
+  noSamples: [rows[2].stats[1], rows[2].stats[2]],
+  longTerm: [rows[3].rel, rows[3].stats[0]],
+  longLabel: ctx.expBody.innerHTML.includes('长期') && ctx.expBody.innerHTML.includes(day(400)),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "expiry-waste-*.cjs")
 	if err != nil {
@@ -2139,5 +2148,68 @@ process.stdout.write(JSON.stringify({
 		`"noSamples":["无近期样本","—"],"longTerm":["长期","0"],"longLabel":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("到期浪费估算不符:\n got=%s\nwant=%s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSExpiryHeroPicksExactEarliest 顶部摘要按精确 expires_at 选全局最近到期，
+// 而不是只按日期：同一天两个账号时，02:00 必须排在 23:00 前面。
+func TestAppJSExpiryHeroPicksExactEarliest(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry hero test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expCSTDate');
+const end = src.indexOf('// 收纳行展开/收起');
+if (start < 0 || end < 0) throw new Error('expiry helpers not found');
+const ctx = { acctName: a => String(a.nickname || a.uid), aliasForUid: () => '',
+  Number, String, Array, Date, Math, JSON, PK_DAY_MS: 86400000,
+  expHero: { innerHTML: '' }, expKpis: { innerHTML: '' },
+  expBody: { innerHTML: '', querySelector: () => null }, expNote: { textContent: '' },
+  esc: s => String(s), fmtTok: n => String(n),
+};
+ctx.$ = id => ctx[id];
+vm.createContext(ctx);
+vm.runInContext("'use strict';\n" + 'const restOpen = Object.create(null);\n' +
+  src.slice(start, end) + '\nthis.renderExpirySnapshot=renderExpirySnapshot;', ctx);
+const day = n => {
+  const d = new Date(Date.now() + n * 86400000);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(d);
+  const p = t => (parts.find(x => x.type === t) || {}).value;
+  return p('year') + '-' + p('month') + '-' + p('day');
+};
+ctx.renderExpirySnapshot({ accounts: [
+  { uid: 'late', nickname: 'late-account', credits_expiry_buckets: [
+    { date: day(1), remain: 999, expires_at: day(1) + 'T23:00:00+08:00' }] },
+  { uid: 'early', nickname: 'early-account', credits_expiry_buckets: [
+    { date: day(1), remain: 30, expires_at: day(1) + 'T02:00:00+08:00' }] },
+]});
+const hero = ctx.expHero.innerHTML;
+process.stdout.write(JSON.stringify({
+  name: hero.includes('early-account'),
+  amount: hero.includes('>30<'),
+  time: hero.includes('02:00'),
+  noLate: !hero.includes('999') && !hero.includes('23:00'),
+  weekKpi: ctx.expKpis.innerHTML.includes('>1029<'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "expiry-hero-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry hero node test failed: %v\n%s", err, out)
+	}
+	const want = `{"name":true,"amount":true,"time":true,"noLate":true,"weekKpi":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("到期摘要选择不符:\n got=%s\nwant=%s", strings.TrimSpace(string(out)), want)
 	}
 }

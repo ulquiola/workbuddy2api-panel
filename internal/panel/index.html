@@ -619,6 +619,83 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .pk-hidden-row[hidden] { display: none; }
   .pk-hidden-row td { color: var(--ink-3); }
 
+  /* ── 积分到期提醒（账号池顶部摘要卡）─────────────────────────────
+     顶部是全局最近到期（精确到分钟），下面每个账号一行；行内左侧色轨表示紧迫度，
+     中间是最近到期金额 + 未来 6 个批次的迷你条，右侧是 7 天/日均/浪费。
+     视觉语言沿用仪表盘：等宽数字、单一强调色、语义色只给状态。 */
+  .exp-hero { position: relative; display: flex; flex-direction: column; gap: 2px;
+    padding: 15px 18px 14px 21px; border-bottom: 1px solid var(--line-soft);
+    background: linear-gradient(135deg, var(--accent-soft), transparent 64%); }
+  .exp-hero::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: var(--exp-tone, var(--ok)); }
+  .exp-lab { font-size: 11px; color: var(--ink-3); letter-spacing: .04em; }
+  .exp-big { display: flex; align-items: baseline; gap: 7px; margin-top: 2px; }
+  .exp-big b { font: 700 30px/1 var(--mono); font-variant-numeric: tabular-nums;
+    letter-spacing: -.03em; color: var(--exp-tone, var(--ok)); }
+  .exp-big span { color: var(--ink-3); font-size: 12px; }
+  .exp-who { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-top: 6px; font-size: 12.5px; color: var(--ink-2); }
+  .exp-who .exp-time { font: 600 12px var(--mono); color: var(--ink); }
+  .exp-who .exp-rel { font-weight: 600; color: var(--exp-tone, var(--ink-2)); }
+  .exp-who .exp-acc { font-weight: 600; color: var(--ink); }
+  .exp-realm { font: 550 10px/1.3 var(--mono); padding: 1px 6px; border-radius: 999px;
+    background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line-soft); }
+  .exp-long { font: 550 10px/1.3 var(--mono); padding: 1px 6px; border-radius: 999px;
+    background: var(--accent-soft); color: var(--accent); }
+  .exp-kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-bottom: 1px solid var(--line-soft); }
+  .exp-kpis:empty { display: none; }
+  .exp-kpi { min-width: 0; padding: 10px 18px 11px; border-right: 1px solid var(--line-soft); }
+  .exp-kpi:last-child { border-right: none; }
+  .exp-kpi .k { font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+  .exp-kpi .v { font: 600 19px/1.2 var(--mono); font-variant-numeric: tabular-nums;
+    margin-top: 2px; white-space: nowrap; }
+  .exp-kpi .s { font-size: 10.5px; color: var(--ink-3); margin-top: 1px; }
+  .exp-kpi.bad .v { color: var(--bad); }
+  .exp-kpi.ok .v { color: var(--ok); }
+  .exp-list { display: block; }
+  .exp-row { position: relative; display: grid;
+    grid-template-columns: minmax(150px, .9fr) minmax(240px, 1.35fr) minmax(210px, .85fr);
+    gap: 16px; align-items: center; padding: 12px 18px 12px 21px;
+    border-bottom: 1px solid var(--line-soft); }
+  .exp-row:last-child { border-bottom: none; }
+  .exp-row:hover { background: var(--surface-2); }
+  .exp-row::before { content: ''; position: absolute; left: 0; top: 9px; bottom: 9px;
+    width: 3px; border-radius: 2px; background: var(--exp-tone, var(--ok)); opacity: .9; }
+  .exp-acc { min-width: 0; }
+  .exp-acc .nm { font-weight: 600; font-size: 13px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .exp-acc .meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    margin-top: 4px; font-size: 11px; color: var(--ink-3); }
+  .exp-nearest { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .exp-nearest b { font: 650 14.5px/1.2 var(--mono); font-variant-numeric: tabular-nums; }
+  .exp-nearest .t { font: 550 11px var(--mono); color: var(--ink-2); }
+  .exp-nearest .rel { font-size: 11px; font-weight: 600; color: var(--exp-tone, var(--ink-3)); }
+  .exp-bars { display: flex; align-items: flex-end; gap: 3px; height: 25px; margin-top: 5px; }
+  .exp-bar { display: block; flex: 1; min-width: 3px; max-width: 18px; border-radius: 2px 2px 0 0;
+    background: var(--exp-tone, var(--accent)); opacity: .55; }
+  .exp-bar:hover { opacity: 1; }
+  .exp-bars .cap { align-self: center; margin-left: 4px; font-size: 10.5px; color: var(--ink-3);
+    white-space: nowrap; }
+  .exp-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px;
+    text-align: right; }
+  .exp-stat { min-width: 0; }
+  .exp-stat .k { font-size: 10.5px; color: var(--ink-3); white-space: nowrap; }
+  .exp-stat .v { font: 600 12.5px/1.3 var(--mono); font-variant-numeric: tabular-nums;
+    margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .exp-stat.bad .v { color: var(--bad); }
+  .exp-stat.ok .v { color: var(--ok); }
+  .exp-rest { padding: 8px 18px; border-top: 1px solid var(--line-soft); background: var(--surface-2); }
+  .exp-rest .pk-group-toggle { text-align: center; }
+  .exp-empty { padding: 30px 16px; text-align: center; color: var(--ink-3); font-size: 12.5px; }
+  @media (max-width: 860px) {
+    .exp-kpis { grid-template-columns: 1fr; }
+    .exp-kpi { border-right: none; border-bottom: 1px solid var(--line-soft); }
+    .exp-kpi:last-child { border-bottom: none; }
+    .exp-row { grid-template-columns: 1fr; gap: 8px; padding-top: 11px; padding-bottom: 11px; }
+    .exp-stats { text-align: left; }
+  }
+
   /* ── 筛选栏（模型档位 / 运行日志 / 用量共用）─────────────────────────
      面板控件默认 input/select 是 width:100%（配置表单要整行），筛选栏里必须显式
      收回宽度，否则第一个控件会把整行撑满、后面的控件被挤到下一行。 */
@@ -834,25 +911,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
 
       <!-- 到期提醒：数据取 /overview 的 credits_expiry_buckets（签到与余额后台刷新
-           按自然日聚合后写入 state.json），打开页面零上游请求。同日多个包合并为一行，
-           后续批次在日期下方列出；完整逐包明细在「积分构成」页。credit_burn_7d
-           提供近 7 天实测扣分，用于估算「按当前速度会用掉多少、可能浪费多少」。 -->
+           按自然日聚合后写入 state.json），打开页面零上游请求。顶部摘要显示全局
+           最近到期（精确到分钟），下面每个账号一行；credit_burn_7d 提供近 7 天
+           实测扣分，用于估算「按当前速度会用掉多少、可能浪费多少」。 -->
       <div class="box">
         <header>
-          <h3>积分到期提醒 <span class="hint">按自然日聚合 · 未来 7 天到期 = 7 天内失效的积分 · 预计浪费 = 按近 7 天实际扣分速度、失效前用不掉的部分（FEFO 估算）</span></h3>
+          <h3>积分到期提醒 <span class="hint">按自然日聚合 · 最近到期精确到分钟 · 预计浪费 = 按近 7 天实际扣分速度、失效前用不掉的部分（FEFO）</span></h3>
           <span class="grow"></span>
           <span class="note" id="expNote"></span>
         </header>
-        <div class="tbl-wrap">
-        <table class="acc">
-          <thead><tr>
-            <th>账号</th><th>最近到期</th><th class="num">距到期</th>
-            <th class="num">未来 7 天到期</th><th class="num">近 7 天日均</th>
-            <th class="num">预计 7 天浪费</th>
-          </tr></thead>
-          <tbody id="expBody"></tbody>
-        </table>
-        </div>
+        <div id="expHero"></div>
+        <div class="exp-kpis" id="expKpis"></div>
+        <div class="exp-list" id="expBody"></div>
       </div>
 
       <div class="box">

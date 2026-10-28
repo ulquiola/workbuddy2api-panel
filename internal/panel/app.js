@@ -3590,17 +3590,22 @@ function expBucketList(a) {
   for (const b of raw) {
     const date = String((b && b.date) || '').slice(0, 10);
     const remain = Number((b && b.remain) || 0);
-    if (date && remain > 0) out.push({ date, remain });
+    if (!date || remain <= 0) continue;
+    const parsed = b && b.expires_at ? new Date(b.expires_at).getTime() : NaN;
+    const hasTime = Number.isFinite(parsed);
+    let at = hasTime ? parsed : Date.parse(date + 'T00:00:00+08:00');
+    if (!Number.isFinite(at)) at = 0;
+    out.push({ date, remain, at, hasTime });
   }
   if (out.length) {
-    out.sort((x, y) => (x.date < y.date ? -1 : x.date > y.date ? 1 : 0));
+    out.sort((x, y) => (x.date < y.date ? -1 : x.date > y.date ? 1 : 0) || (x.at - y.at));
     return out;
   }
   // 旧 state 兜底：只有最早一批。
   const ms = a && a.credits_earliest_expiry ? new Date(a.credits_earliest_expiry).getTime() : NaN;
   const remain = Number((a && a.credits_earliest_remaining) || 0);
   if (Number.isFinite(ms) && remain > 0) {
-    return [{ date: expCSTDate(ms), remain }];
+    return [{ date: expCSTDate(ms), remain, at: ms, hasTime: true }];
   }
   return [];
 }
@@ -3614,8 +3619,31 @@ function expDayDiff(dateStr) {
   return Math.round((ms - base) / PK_DAY_MS);
 }
 
+// expCSTParts 把时间戳拆成 UTC+8 的日期/时分。与 expCSTDate 同口径，但保留分钟。
+function expCSTParts(ms) {
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(d);
+  const p = t => (parts.find(x => x.type === t) || {}).value || '';
+  return { year: p('year'), month: p('month'), day: p('day'), hour: p('hour'), minute: p('minute') };
+}
+
+// expShortDateTime 精确到分钟的到期时间：同年省略年份，跨年显示完整日期。
+// hasTime=false（旧 state 只有日期）只显示日期，不伪造 00:00。
+function expShortDateTime(ms, hasTime) {
+  const p = expCSTParts(ms);
+  if (!p) return '';
+  const today = expCSTDate(Date.now());
+  const date = p.year === today.slice(0, 4)
+    ? p.month + '-' + p.day
+    : p.year + '-' + p.month + '-' + p.day;
+  return hasTime === false ? date : date + ' ' + p.hour + ':' + p.minute;
+}
+
 // expDateLabel 后续批次/长期包的日期：同年只显示 MM-DD，跨年显示完整日期。
-// 旧实现一律 slice(5)，把 2034-12-15 显示成「12-15」，看起来像两个月后到期。
 function expDateLabel(date) {
   const today = expCSTDate(Date.now());
   return date && date.slice(0, 4) === today.slice(0, 4) ? date.slice(5) : date;
@@ -3627,6 +3655,18 @@ function expDaysLabel(days) {
   if (days === 0) return '今天';
   if (days === 1) return '明天';
   return days + ' 天';
+}
+
+// expRelLabel 相对到期文案：已过精确时刻的批次直接标「已到期」，不把今天已过的时间
+// 说成「今天」。
+function expRelLabel(days, at) {
+  if (Number.isFinite(at) && at <= Date.now()) return '已到期';
+  return expDaysLabel(days);
+}
+
+// expTone 紧迫度色：今天/明天红，3 天内黄，其余绿。
+function expTone(days) {
+  return days <= 1 ? 'var(--bad)' : days <= 3 ? 'var(--warn)' : 'var(--ok)';
 }
 
 // expWaste 按 FEFO 估算未来 horizon 天内会浪费多少积分。
@@ -3649,9 +3689,85 @@ function expWaste(bs, burnPerDay, horizon) {
   return waste;
 }
 
+// expBarsHTML 未来 6 个到期批次的迷你条：高度按剩余量，hover 显示精确时间与金额。
+// 用实际批次而不是固定日历格，避免「同一天多个包」被压成一格。
+function expBarsHTML(bs, maxBars) {
+  const shown = bs.slice(0, maxBars || 6);
+  const max = Math.max(1, ...shown.map(b => Math.max(0, Number(b.remain) || 0)));
+  return shown.map(b => {
+    const remain = Math.max(0, Number(b.remain) || 0);
+    const h = Math.max(3, Math.round(remain / max * 22));
+    const when = expShortDateTime(b.at, b.hasTime);
+    const title = (when ? when + ' · ' : '') + fmtTok(remain) + ' 分';
+    return '<i class="exp-bar" style="height:' + h + 'px" title="' + esc(title) + '"></i>';
+  }).join('');
+}
+
+// expHeroHTML 全局最近到期：精确时间排序后取第一条，金额是当天合计。
+function expHeroHTML(a, b, days) {
+  const tone = expTone(days);
+  return '<div class="exp-hero" style="--exp-tone:' + tone + '">' +
+    '<div class="exp-lab">最近到期 · 当天合计</div>' +
+    '<div class="exp-big"><b>' + fmtTok(b.remain) + '</b><span>分</span></div>' +
+    '<div class="exp-who">' +
+      '<span class="exp-time">' + esc(expShortDateTime(b.at, b.hasTime)) + '</span>' +
+      '<span class="exp-rel">' + esc(expRelLabel(days, b.at)) + '</span>' +
+      '<span class="exp-acc">' + esc(acctName(a)) + '</span>' +
+      (a.realm ? '<span class="exp-realm">' + esc(a.realm) + '</span>' : '') +
+    '</div></div>';
+}
+
+// expKpisHTML 三个汇总：7 天到期 / 日均 / 预计浪费。
+// 日均与浪费只对「有扣分样本」的账号可估，scope 用来说明这两个数覆盖了谁。
+function expKpisHTML(week, burnPerDay, waste, scope) {
+  const burnText = burnPerDay === null ? '—' : fmtTok(Math.round(burnPerDay)) + '/天';
+  const wasteText = waste === null ? '—' : fmtTok(waste);
+  const wasteCls = waste === null ? '' : waste > 0 ? ' bad' : ' ok';
+  return '<div class="exp-kpi"><div class="k">未来 7 天到期</div><div class="v">' + fmtTok(week) + '</div><div class="s">全部账号</div></div>' +
+    '<div class="exp-kpi"><div class="k">近 7 天日均</div><div class="v">' + burnText + '</div><div class="s">' + esc(scope) + '</div></div>' +
+    '<div class="exp-kpi' + wasteCls + '"><div class="k">预计 7 天浪费</div><div class="v">' + wasteText + '</div><div class="s">' + esc(scope) + '</div></div>';
+}
+
+// expRowHTML 单账号行：账号 + 最近到期 + 迷你条 + 三个数字。
+function expRowHTML(a, bs, burnMap, hidden) {
+  const first = bs[0];
+  const days = expDayDiff(first.date);
+  const tone = expTone(days);
+  const week = bs.filter(b => expDayDiff(b.date) <= 7).reduce((s, b) => s + b.remain, 0);
+  const burn = burnMap[String(a.uid || '')];
+  const burnPerDay = burn && Number(burn.samples) > 0 ? Number(burn.credits || 0) / 7 : null;
+  const waste = burnPerDay === null ? null : Math.ceil(expWaste(bs, burnPerDay, 7));
+  const burnText = burnPerDay === null ? '无近期样本' : fmtTok(Math.round(burnPerDay)) + '/天';
+  const wasteText = waste === null ? '—' : fmtTok(waste);
+  const wasteCls = waste === null ? '' : waste > 0 ? ' bad' : ' ok';
+  const longTerm = bs.find(b => expDayDiff(b.date) > 90);
+  const longBadge = longTerm
+    ? '<span class="exp-long" title="长期包到期 ' + esc(expDateLabel(longTerm.date)) + '">长期 ' +
+      fmtTok(longTerm.remain) + '</span>'
+    : '';
+  return '<div class="exp-row"' + (hidden ? ' data-exp-row="rest" hidden' : '') + ' style="--exp-tone:' + tone + '">' +
+    '<div class="exp-acc">' +
+      '<div class="nm">' + esc(acctName(a)) + '</div>' +
+      '<div class="meta">' + (a.realm ? '<span class="exp-realm">' + esc(a.realm) + '</span>' : '') +
+      longBadge + '</div>' +
+    '</div>' +
+    '<div>' +
+      '<div class="exp-nearest"><b>' + fmtTok(first.remain) + ' 分</b>' +
+        '<span class="t">' + esc(expShortDateTime(first.at, first.hasTime)) + '</span>' +
+        '<span class="rel">' + esc(expRelLabel(days, first.at)) + '</span></div>' +
+      '<div class="exp-bars">' + expBarsHTML(bs, 6) + '<span class="cap">共 ' + bs.length + ' 批</span></div>' +
+    '</div>' +
+    '<div class="exp-stats">' +
+      '<div class="exp-stat"><div class="k">7 天到期</div><div class="v">' + fmtTok(week) + '</div></div>' +
+      '<div class="exp-stat"><div class="k">近 7 天日均</div><div class="v">' + burnText + '</div></div>' +
+      '<div class="exp-stat' + wasteCls + '"><div class="k">预计浪费</div><div class="v">' + wasteText + '</div></div>' +
+    '</div>' +
+  '</div>';
+}
+
 function renderExpirySnapshot(d) {
-  const rows = [];
   const burnMap = (d && d.credit_burn_7d) || {};
+  const rows = [];
   for (const a of (d && d.accounts) || []) {
     const bs = expBucketList(a).filter(b => {
       const days = expDayDiff(b.date);
@@ -3667,43 +3783,42 @@ function renderExpirySnapshot(d) {
     const ay = String(y.a.nickname || y.a.uid || '');
     return ax < ay ? -1 : ax > ay ? 1 : 0;
   });
-  const EXP_HEAD = 3;  // 默认只展开最近到期的 3 个账号，其余收纳成一行
-  const rowOf = ({ a, bs }, hidden) => {
-    const first = bs[0];
-    const days = expDayDiff(first.date);
-    const week = bs.filter(b => expDayDiff(b.date) <= 7).reduce((s, b) => s + b.remain, 0);
-    const burn = burnMap[String(a.uid || '')];
-    const burnPerDay = burn && Number(burn.samples) > 0 ? Number(burn.credits || 0) / 7 : null;
-    const waste = burnPerDay === null ? null : Math.ceil(expWaste(bs, burnPerDay, 7));
-    const color = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
-    const wasteColor = waste > 0 ? 'var(--bad)' : 'var(--ok)';
-    const more = bs.length > 4 ? '　共 ' + bs.length + ' 批' : '';
-    const rest = bs.slice(1, 4).map(b =>
-      '随后 ' + esc(expDateLabel(b.date)) + ' · ' + fmtTok(b.remain)).join('　') + more;
-    const longTerm = bs.find(b => expDayDiff(b.date) > 90);
-    const sub = (rest ? '<div class="note">' + rest + '</div>' : '') +
-      (longTerm ? '<div class="note">长期 ' + esc(expDateLabel(longTerm.date)) +
-        ' · ' + fmtTok(longTerm.remain) + '</div>' : '');
-    const burnText = burnPerDay === null ? '无近期样本' : fmtTok(Math.round(burnPerDay)) + '/天';
-    return '<tr' + (hidden ? ' data-exp-row="rest" hidden' : '') + '>' +
-      '<td>' + esc(acctName(a)) + '</td>' +
-      '<td>' + esc(first.date) + sub + '</td>' +
-      '<td class="num" style="color:' + color + '">' + expDaysLabel(days) + '</td>' +
-      '<td class="num">' + fmtTok(week) + '</td>' +
-      '<td class="num">' + burnText + '</td>' +
-      '<td class="num"' + (waste === null ? '' : ' style="color:' + wasteColor + '"') + '>' +
-        (waste === null ? '—' : fmtTok(waste)) + '</td>' +
-      '</tr>';
-  };
-  // 收纳行沿用「积分构成」页的分组行样式（pk-group-summary / pk-group-toggle）。
+  const heroEl = $('expHero'), kpisEl = $('expKpis');
+  if (!rows.length) {
+    if (heroEl) heroEl.innerHTML = '<div class="exp-empty">暂无未来到期批次</div>';
+    if (kpisEl) kpisEl.innerHTML = '';
+    $('expBody').innerHTML = '';
+    $('expNote').textContent = '暂无未来到期批次';
+    return;
+  }
+  // 全局最近到期按精确 expires_at 选；同日多账号时能选到更早那批，而不是只看日期。
+  const all = [];
+  for (const r of rows) for (const b of r.bs) all.push({ a: r.a, b });
+  all.sort((x, y) => (x.b.at - y.b.at) || (y.b.remain - x.b.remain));
+  const near = all[0];
+  if (heroEl) heroEl.innerHTML = expHeroHTML(near.a, near.b, expDayDiff(near.b.date));
+  // 全部账号 KPI：日均与浪费只统计有扣分样本的账号；没有样本时显示 —。
+  let week = 0, burnSum = 0, waste = 0, known = 0;
+  for (const r of rows) {
+    const burn = burnMap[String(r.a.uid || '')];
+    const per = burn && Number(burn.samples) > 0 ? Number(burn.credits || 0) / 7 : null;
+    week += r.bs.filter(b => expDayDiff(b.date) <= 7).reduce((s, b) => s + b.remain, 0);
+    if (per !== null) {
+      known++;
+      burnSum += per;
+      waste += Math.ceil(expWaste(r.bs, per, 7));
+    }
+  }
+  const scope = known === 0 ? '暂无样本' : known === rows.length ? '全部账号' : '有样本账号';
+  if (kpisEl) kpisEl.innerHTML = expKpisHTML(week, known ? burnSum : null, known ? waste : null, scope);
+  // 前 3 个账号展开，其余收纳；重建 innerHTML 后按 restOpen 恢复用户选择。
+  const EXP_HEAD = 3;
   const rest = rows.slice(EXP_HEAD);
-  $('expBody').innerHTML = !rows.length ? '<tr><td colspan="6">暂无未来到期批次</td></tr>'
-    : rows.slice(0, EXP_HEAD).map(r => rowOf(r, false)).join('') +
-      (rest.length ? '<tr class="pk-group-summary"><td colspan="6">' +
-        '<button type="button" class="pk-group-toggle" data-exp-rest="' + rest.length +
-        '" aria-expanded="false">其余 ' + rest.length + ' 个账号，展开</button></td></tr>' +
-        rest.map(r => rowOf(r, true)).join('') : '');
-  // 重建 tbody 后恢复用户上次的展开选择（否则下一轮 5s 轮询会把展开收回）。
+  $('expBody').innerHTML = rows.slice(0, EXP_HEAD).map(r => expRowHTML(r.a, r.bs, burnMap, false)).join('') +
+    (rest.length ? '<div class="exp-rest"><button type="button" class="pk-group-toggle" data-exp-rest="' + rest.length +
+      '" aria-expanded="false">其余 ' + rest.length + ' 个账号，展开</button></div>' +
+      rest.map(r => expRowHTML(r.a, r.bs, burnMap, true)).join('') : '');
+  // 重建后恢复用户上次的展开选择（否则下一轮 5s 轮询会把展开收回）。
   applyRestToggle($('expBody'), restOpen.expBody);
   // 数据节奏透明化：界面 5 秒轮询，但卡片只随余额后台刷新更新（默认每 5 分钟）。
   const iv = Number(d && d.balance_refresh_sec) || 0;
@@ -3716,26 +3831,24 @@ function renderExpirySnapshot(d) {
       cadence += '，' + (min < 1 ? '刚刚更新' : min + ' 分钟前更新');
     }
   }
-  $('expNote').textContent = rows.length
-    ? rows.length + ' 个账号有未到期批次 · ' + cadence + ' · 明细见「积分构成」'
-    : '暂无未来到期批次';
+  $('expNote').textContent = rows.length + ' 个账号有未到期批次 · ' + cadence + ' · 明细见「积分构成」';
 }
 
-// 按 restOpen 把指定 tbody 的收纳行落到「展开/收起」状态。渲染重建 innerHTML 后必须调用一次，
+// 按 restOpen 把指定容器的收纳行落到「展开/收起」状态。渲染重建 innerHTML 后必须调用一次，
 // 否则用户上一次的展开选择会丢（5s 轮询每次都会重建）。
 function applyRestToggle(body, expanded) {
   if (!body) return;
   const btn = body.querySelector('button[data-exp-rest]');
   if (!btn) return;
-  body.querySelectorAll('tr[data-exp-row="rest"]').forEach(row => { row.hidden = !expanded; });
+  body.querySelectorAll('[data-exp-row="rest"]').forEach(row => { row.hidden = !expanded; });
   btn.setAttribute('aria-expanded', String(!!expanded));
   btn.textContent = (expanded ? '收起其余 ' : '其余 ') + btn.dataset.expRest + ' 个账号' +
     (expanded ? '' : '，展开');
 }
 
 // 收纳行展开/收起（与「积分构成」页 pkDetail 同款：查 data 行 + aria-expanded + 改按钮文案）。
-// 监听挂在 tbody 上（渲染替换 innerHTML 不会丢）；到期提醒用本函数。
-// 用户选择写进 restOpen，渲染函数重建 tbody 后调 applyRestToggle 恢复。
+// 监听挂在容器上（渲染替换 innerHTML 不会丢）；到期提醒用本函数。
+// 用户选择写进 restOpen，渲染函数重建容器后调 applyRestToggle 恢复。
 function bindRestToggle(id) {
   const body = $(id);
   if (!body) return;
