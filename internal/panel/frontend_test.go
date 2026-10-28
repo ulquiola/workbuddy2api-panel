@@ -239,7 +239,7 @@ const store = { jobs: [
   ]},
   { uid: 'u2', nickname: 'B', trigger: 'new_account', status: 'running', results: [] },
 ] };
-const ctx = {
+const ctx = { acctName: a => String((a && (a.alias || a.nickname)) || (a && a.uid) || ''), aliasForUid: () => '', 
   String, Number, RegExp, Object, Array, Map, JSON, Promise, console,
   api: async () => ({ jobs: store.jobs, auto_enabled: true }),
   renderQueue: (groups, progress, title, desc) => calls.push({ groups, title, desc }),
@@ -319,7 +319,7 @@ const jobsStart = src.indexOf('function taskOutcomeStatus'), jobsEnd = src.index
 const nameStart = src.indexOf('function groupItems(d)'), nameEnd = src.indexOf('function renderQueue');
 const titlesStart = src.indexOf('const GROWTH_TITLES'), titlesLine = src.slice(titlesStart, src.indexOf('\n', titlesStart));
 assert.ok(jobsStart >= 0 && jobsEnd > jobsStart && nameStart >= 0 && nameEnd > nameStart && titlesStart >= 0);
-const ctx = { String, Number, RegExp, Object, Array, Map, JSON, console, esc: s => String(s == null ? '' : s) };
+const ctx = { acctName: a => String((a && (a.alias || a.nickname)) || (a && a.uid) || ''), aliasForUid: () => '',  String, Number, RegExp, Object, Array, Map, JSON, console, esc: s => String(s == null ? '' : s) };
 const dom = new Proxy(function () {}, { get: (t, k) => (k === Symbol.toPrimitive ? () => '' : dom), set: () => true, apply: () => dom });
 Object.assign(ctx, { $: () => dom, document: dom, window: dom, localStorage: dom, location: dom });
 vm.createContext(ctx);
@@ -947,7 +947,7 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('const PK_ACCOUNT_COLORS');
 const end = src.indexOf('function renderExpiryDistribution');
 if (start < 0 || end < 0) throw new Error('expiry summary functions not found');
-const ctx = { Date, Math, Number, String, Map, Array, Object, isFinite };
+const ctx = { acctName: a => String((a && (a.alias || a.nickname)) || (a && a.uid) || ''), aliasForUid: () => '',  Date, Math, Number, String, Map, Array, Object, isFinite };
 vm.createContext(ctx);
 vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.summarizeCreditDays = summarizeCreditDays; this.pkAccountColorMap = pkAccountColorMap;', ctx);
 const day = 86400000, now = 100000;
@@ -1038,6 +1038,8 @@ function extractFn(name) {
 const GROWTH_TITLES = {};
 const ST_WORDS = { done: '完成', scan: '待执行' };
 function esc(s) { return String(s == null ? '' : s); }
+function aliasForUid(uid) { return ''; }
+function acctName(a) { return String((a && (a.alias || a.nickname)) || (a && a.uid) || ''); }
 eval(extractFn('taskProgressLabel'));
 eval(extractFn('qrowHTML'));
 eval(extractFn('groupsFromQueue'));
@@ -1532,7 +1534,7 @@ const start = src.indexOf('function expCSTDate');
 const end = src.indexOf('let lastPackages');
 if (start < 0 || end < 0 || end < start) throw new Error('expiry snapshot region not found');
 const els = {};
-const ctx = {
+const ctx = { acctName: a => String((a && (a.alias || a.nickname)) || (a && a.uid) || ''), aliasForUid: () => '', 
   Date, Math, Number, String, isFinite,
   PK_DAY_MS: 86400000,
   $: id => (els[id] = els[id] || {
@@ -1598,38 +1600,30 @@ process.stdout.write(JSON.stringify({
 // 账号备注：键取 uid 前 8 位（与 renderUsageDim 账号维度、积分扣除表的 uid 前缀同源，
 // 三个表格因此能直接 join）；有备注时备注当主标识、原昵称作浅色虚体跟随；备注来自本机
 // 输入，必须转义后才能拼进 innerHTML。
-func TestAppJSRemarkName(t *testing.T) {
+// TestAppJSAcctName 账号展示名：本地备注名 > 上游昵称 > uid8。
+// 备注名由服务端 alias 下发（昵称同步不覆盖），所有账号视图统一走这里。
+func TestAppJSAcctName(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
-		t.Skip("node not installed; remark name test skipped")
+		t.Skip("node not installed; acctName test skipped")
 	}
-	script := `const fs = require('fs');
-const vm = require('vm');
+	script := `const fs = require('fs'), vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
-const escStart = src.indexOf('function esc(');
-const escEnd = src.indexOf('function ago(');
-const start = src.indexOf('function remarkKey(');
-const end = src.indexOf('function storeRemarks(');
-if (escStart < 0 || escEnd < 0) throw new Error('esc helpers not found');
-if (start < 0 || end < 0) throw new Error('remark helpers not found');
-const ctx = { String, RegExp, Number };
+const s = src.indexOf('function acctName');
+const e = src.indexOf('const accBodyEl');
+if (s < 0 || e < 0) throw new Error('acctName helpers not found');
+const ctx = { String, Array, overviewData: { accounts: [{ uid: 'u1', alias: '主号' }] } };
 vm.createContext(ctx);
-vm.runInContext("'use strict';\n" + 
-  src.slice(escStart, escEnd) + src.slice(start, end) +
-  '\nconst REM = {abcdef12: "JTOL", deadbeef: "<b>x</b>"};' +
-  '\nfunction remarksAll() { return REM; }' +
-  '\nthis.remarkKey=remarkKey; this.remarkName=remarkName;',
-  ctx
-);
+vm.runInContext(src.slice(s, e), ctx);
 process.stdout.write(JSON.stringify({
-  key: ctx.remarkKey('ABCDEF1234567890'),
-  short: ctx.remarkKey('abc'),
-  empty: ctx.remarkKey(null),
-  remarked: ctx.remarkName('abcdef12', '张三'),
-  plain: ctx.remarkName('zzzzzzzz', '张三'),
-  escaped: ctx.remarkName('deadbeef', 'n'),
+  alias: ctx.acctName({ uid: 'u1', alias: '主号', nickname: 'muhe' }),
+  fromOverview: ctx.acctName({ uid: 'u1', nickname: 'muhe' }),
+  nickname: ctx.acctName({ uid: 'u2', nickname: 'muhe' }),
+  uid8: ctx.acctName({ uid: '1234567890abcdef' }),
+  forUid: ctx.aliasForUid('u1'),
+  missing: ctx.aliasForUid('nope'),
 }));`
-	f, err := os.CreateTemp(t.TempDir(), "remark-name-*.cjs")
+	f, err := os.CreateTemp(t.TempDir(), "acctname-*.cjs")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1639,53 +1633,43 @@ process.stdout.write(JSON.stringify({
 	f.Close()
 	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
 	if err != nil {
-		t.Fatalf("remark name node test failed: %v\n%s", err, out)
+		t.Fatalf("acctName node test failed: %v\n%s", err, out)
 	}
-	const want = `{"key":"ABCDEF12","short":"abc","empty":"","remarked":"JTOL<span class=\"rm-ghost\">张三</span>","plain":"张三","escaped":"&lt;b&gt;x&lt;/b&gt;<span class=\"rm-ghost\">n</span>"}`
+	const want = `{"alias":"主号","fromOverview":"主号","nickname":"muhe","uid8":"12345678","forUid":"主号","missing":""}`
 	if strings.TrimSpace(string(out)) != want {
-		t.Fatalf("remark name=%s\nwant %s", strings.TrimSpace(string(out)), want)
+		t.Fatalf("acctName=%s\nwant %s", strings.TrimSpace(string(out)), want)
 	}
 }
 
-// 备注与折叠的接线齐备性：少一个 id 或漏一个 localStorage 键，表现为「按钮点了没反应」，
-// 而 Go 编译、JS 语法检查、顶层冒烟都发现不了（脚本能正常跑，只是挂不上）。
-// 本仓只取了 PR #178 的备注部分（积分到期折叠未移植：到期提醒已重做为图表式），
-// 故这里只查备注相关 id / 键 / 函数。
-func TestPanelRemarkWiring(t *testing.T) {
+// TestPanelAliasWiring 账号备注接线：服务端 alias + 就地编辑；旧的 localStorage
+// 备注（btnRemarks/remarkVeil/storeRemarks）必须已彻底移除，避免两套备注并存。
+func TestPanelAliasWiring(t *testing.T) {
 	html, err := os.ReadFile("index.html")
 	if err != nil {
 		t.Fatal(err)
-	}
-	for _, want := range []string{
-		`id="btnRemarks"`, `id="remarkVeil"`, `id="remarkBody"`,
-		`id="btnRemarkSave"`, `id="btnRemarkClear"`, `id="btnRemarkClose"`,
-	} {
-		if !bytes.Contains(html, []byte(want)) {
-			t.Fatalf("index.html 缺少 %s", want)
-		}
 	}
 	js, err := os.ReadFile("app.js")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{
-		"LS_REMARKS = 'wb2api.remarks.v1'",
-		"function remarkKey(",
-		"function remarkName(",
-		"function storeRemarks(",
-	} {
+	for _, want := range []string{"alias-edit", "data-alias-uid", "/alias'", "alias-input"} {
 		if !bytes.Contains(js, []byte(want)) {
-			t.Fatalf("app.js 缺少 %s", want)
+			t.Fatalf("app.js 缺少备注接线: %s", want)
 		}
+	}
+	for _, gone := range []string{"LS_REMARKS", "remarkVeil", "btnRemarks", "storeRemarks", "remarkName("} {
+		if bytes.Contains(js, []byte(gone)) {
+			t.Fatalf("app.js 仍残留旧 localStorage 备注: %s", gone)
+		}
+	}
+	if bytes.Contains(html, []byte(`id="btnRemarks"`)) || bytes.Contains(html, []byte(`id="remarkVeil"`)) {
+		t.Fatal("index.html 仍残留旧备注弹窗/按钮")
+	}
+	if !bytes.Contains(html, []byte(".alias-input")) {
+		t.Fatal("index.html 缺少 .alias-input 样式")
 	}
 }
 
-// TestAppJSExpiryRestToggleSurvivesRerender 钉住「其余 N 个账号」的展开态不会被 5s 轮询自动收起。
-//
-// 根因：账号池每 5s 调 loadOverview → renderExpirySnapshot 重建 #expBody.innerHTML；展开状态
-// 原先只写在 DOM（aria-expanded / hidden）上，重建即丢（用户看到「点展开后什么都不点又收起」）。
-// 现在状态存在模块级 restOpen，渲染后由 applyRestToggle 恢复；本测试同时钉住两个渲染函数的
-// 调用接线（只存状态不恢复，行为仍会回退）。
 func TestAppJSExpiryRestToggleSurvivesRerender(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -1857,7 +1841,7 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function expCSTDate');
 const end = src.indexOf('// 收纳行展开/收起');
 if (start < 0 || end < 0) throw new Error('expiry snapshot helpers not found');
-const ctx = {
+const ctx = { acctName: a => String((a && (a.alias || a.nickname)) || (a && a.uid) || ''), aliasForUid: () => '', 
   Number, String, Array, Date, Math, JSON, PK_DAY_MS: 86400000,
   expBody: { innerHTML: '', querySelector: () => null }, expNote: { textContent: '' },
   esc: s => String(s), fmtTok: n => String(n),

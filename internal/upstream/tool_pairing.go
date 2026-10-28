@@ -260,3 +260,99 @@ func toolCallNameMissing(tc map[string]any) bool {
 	}
 	return strings.TrimSpace(name) == ""
 }
+
+// mergeAdjacentToolCalls 把**背靠背**的 assistant.tool_calls 消息合成一条（tool_calls 依原序拼接）。
+//
+// 上游 deepseek 系模型对「带 tool_calls 的 assistant 紧跟另一条带 tool_calls 的
+// assistant」判 400 code=11148（tool_call_sequence_broken）并顶死整条会话。
+// 部分 OpenAI 兼容 agent 客户端回放历史时正是这个报文形状。出站管线改为
+// merge → repack → cleanup 三步，先合并 repack 才看得到完整的一批调用。
+//
+// 合并条件从严，避免引入新语义：
+//   - 两条消息**相邻**（中间隔着任何消息都不合并——隔着消息说明不是同一批声明，
+//     凭猜测合并会改变语义，这类形态按其原样交给 repackToolResultBlocks 处理）；
+//   - 后一条 content 为空（content 非空无法无损拼接，不猜语义）；
+//   - 前一条本身必须是带 tool_calls 的 assistant（否则不合并）。
+//
+// reasoning_content（多轮回填字段）不丢：后一条有则搬到合并结果，两边都有则换行拼接。
+func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
+	if len(messages) < 2 {
+		return messages, false
+	}
+	out := make([]any, 0, len(messages))
+	changed := false
+	for _, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			out = append(out, m)
+			continue
+		}
+		if role, _ := msg["role"].(string); role == "assistant" && len(out) > 0 {
+			// 形态一：本条是带 tool_calls 的 assistant 且没有正文 → 并入上一条
+			// 同为 assistant 且带 tool_calls 的消息（背靠背的并行调用声明）。
+			if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 && emptyContent(msg["content"]) {
+				if prev, ok := out[len(out)-1].(map[string]any); ok {
+					if prevRole, _ := prev["role"].(string); prevRole == "assistant" {
+						if prevCalls, ok := prev["tool_calls"].([]any); ok && len(prevCalls) > 0 {
+							prev["tool_calls"] = append(prevCalls, tcs...)
+							mergeReasoningContent(prev, msg)
+							changed = true
+							continue // 本条已并入上一条，不再单独出站
+						}
+					}
+				}
+			}
+			// 形态二（反向）：本条是纯正文 assistant，上一条是带 tool_calls 但没正文的
+			// assistant → 把正文折进上一条，合成 assistant(正文 + tool_calls)。
+			// 条件同样从严：只认**字符串正文**（数组正文可能含多模态块，拼接会丢结构，
+			// 交给 repackToolResultBlocks 原样处理）；上一条必须自身无正文。
+			if _, hasCalls := msg["tool_calls"]; !hasCalls {
+				if txt, ok := msg["content"].(string); ok && txt != "" {
+					if prev, ok := out[len(out)-1].(map[string]any); ok {
+						if prevRole, _ := prev["role"].(string); prevRole == "assistant" {
+							if prevCalls, ok := prev["tool_calls"].([]any); ok && len(prevCalls) > 0 && emptyContent(prev["content"]) {
+								prev["content"] = txt
+								mergeReasoningContent(prev, msg)
+								changed = true
+								continue // 正文已折进上一条
+							}
+						}
+					}
+				}
+			}
+		}
+		out = append(out, m)
+	}
+	if !changed {
+		return messages, false
+	}
+	return out, true
+}
+
+// mergeReasoningContent 把 src 的 reasoning_content 并入 dst（两边都有则换行拼接）。
+func mergeReasoningContent(dst, src map[string]any) {
+	rc, _ := src["reasoning_content"].(string)
+	if rc == "" {
+		return
+	}
+	if prevRC, _ := dst["reasoning_content"].(string); prevRC != "" {
+		dst["reasoning_content"] = prevRC + "\n" + rc
+		return
+	}
+	dst["reasoning_content"] = rc
+}
+
+// emptyContent content 是否为空（缺失 / nil / 空串 / 空数组）。
+// 空数组也必须算空：有客户端把"没有正文"发成 `content: []` 而不是 null。
+// 非空数组仍视为有内容：宁可漏合并，也不丢内容。
+func emptyContent(v any) bool {
+	switch c := v.(type) {
+	case nil:
+		return true
+	case string:
+		return c == ""
+	case []any:
+		return len(c) == 0
+	}
+	return false
+}

@@ -79,6 +79,9 @@ type ExpiryBucket struct {
 type Status struct {
 	UID          string `json:"uid"`
 	Nickname     string `json:"nickname,omitempty"`
+	// Alias 本地备注名（面板可编辑，仅本地面板使用；与上游 nickname 独立，
+	// 昵称同步不会覆盖）。空 = 未设置，前端回落到 nickname/uid。
+	Alias        string `json:"alias,omitempty"`
 	Credits      int64  `json:"credits"`
 	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
 	// ReserveBlocked 是否因「保留积分」停牌（余额已知且 <= 阈值）：账号仍在池中、
@@ -256,6 +259,9 @@ type entry struct {
 	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
 	paused bool
 	reason string
+	// alias 本地备注名（面板就地编辑）。与 auth.Nickname 独立：昵称同步只改
+	// nickname，不会覆盖 alias；持久化在 state.json（stateAccount.Alias）。
+	alias string
 	// disabledAt 禁用时刻（零值 = 未禁用）。与 reason 配对：运维需要知道
 	// 「什么时候被禁的」——同样一句 401，是刚刚发生还是挂了一周，处置完全不同。
 	disabledAt time.Time
@@ -528,6 +534,8 @@ type stateAccount struct {
 	Disabled         bool      `json:"disabled"`
 	Paused           bool      `json:"paused,omitempty"`
 	Reason           string    `json:"reason,omitempty"`
+	// Alias 本地备注名（面板就地编辑；与上游 nickname 独立，昵称同步不覆盖）。
+	Alias            string    `json:"alias,omitempty"`
 	DisabledAt       time.Time `json:"disabled_at,omitempty"` // 禁用时刻（持久化：重启后仍能看出禁了多久）
 	Until            time.Time `json:"until,omitempty"`
 	CoolKind         CoolKind  `json:"cool_kind"`

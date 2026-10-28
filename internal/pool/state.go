@@ -789,6 +789,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Enterprise:               e.a.IsEnterprise(),
 		APIKey:                   e.a.IsAPIKey(),
 		Nickname:                 e.a.Nickname,
+		Alias:                    e.alias,
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		CreditsExpiring:          e.creditsExpiring,

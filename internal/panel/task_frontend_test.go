@@ -19,7 +19,7 @@ func TestTaskFrontendCapabilitiesAndResults(t *testing.T) {
 const src=fs.readFileSync(process.argv[2],'utf8');
 const start=src.indexOf('function checkinResultNote('),end=src.indexOf('// 可自动完成的任务');
 assert(start>=0&&end>start);
-const ctx={AUTO_TASKS:{chat_5:'chat'},GROWTH_TITLES:{}};
+const ctx={acctName:a=>String((a&&(a.alias||a.nickname))||(a&&a.uid)||''),aliasForUid:()=>'',AUTO_TASKS:{chat_5:'chat'},GROWTH_TITLES:{}};
 vm.createContext(ctx);vm.runInContext(src.slice(start,end),ctx);
 const global=ctx.taskRowPresentation({task_code:'first_chat',code:'first_chat',task_id:1,status:'available',progress_known:false,reward_known:false},{accept:false,claim:false,automate:false});
 assert.equal(global.code,'first_chat');assert.equal(global.progress,'未提供');assert.equal(global.reward,'未提供');assert.equal(global.action,'');

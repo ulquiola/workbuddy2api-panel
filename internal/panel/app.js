@@ -1,9 +1,8 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
-/* 账号备注的本机键（模块级声明放顶部，避开 TDZ）。 */
-const LS_REMARKS = 'wb2api.remarks.v1';
-let remarksCache = null;
+/* 行内编辑备注期间置 true：overview 轮询会重绘账号表，需暂停重绘避免输入框被冲掉。 */
+let aliasEditing = false;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null, updateData = null, updateBusy = false;
@@ -482,6 +481,7 @@ setTimeout(() => {
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
 function renderAccounts(list) {
+  if (typeof aliasEditing !== 'undefined' && aliasEditing) return; // 编辑备注中不重绘，保存/取消后由下一次 loadOverview 恢复
   const tb = $('accBody');
   if (!list.length) {
     setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>');
@@ -521,6 +521,11 @@ function renderAccounts(list) {
       : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
+    const alias = String(s.alias || '').trim();
+    const nick = String(s.nickname || '').trim();
+    // 有备注名时：主名称显示备注，副行保留「上游昵称 · uid」便于核对；无备注保持现状。
+    const secondary = alias ? (nick || '未命名') + ' · ' + short : short;
+    const displayName = alias || nick || '未命名';
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
     const unlimited = s.credits_total === -1;
@@ -556,7 +561,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + (s.api_key ? ' <span class="realm-tag">API Key</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm alias-edit" data-alias-uid="' + esc(s.uid) + '" data-alias-val="' + esc(alias) + '" data-alias-nick="' + esc(nick) + '" title="点击编辑备注名（留空清除）">' + esc(displayName) + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + (s.api_key ? ' <span class="realm-tag">API Key</span>' : '') + '</div><div class="id">' + esc(secondary) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -2266,7 +2271,7 @@ function groupsFromJobs(jobs) {
   return jobs.map(job => {
     const info = taskJobPresentation(job);
     return {
-      uid: job.uid, nick: job.nickname,
+      uid: job.uid, nick: aliasForUid(job.uid) || job.nickname,
       cnt: info.trigger + ' · ' + info.label + (info.progress ? ' · ' + info.progress : ''),
       tip: info.message, // 明细挂 title（原「后台自动任务」卡的状态行）
       rows: (job.results || []).map(item => ({
@@ -2409,7 +2414,7 @@ function groupItems(d) {
     }
     if (a.growth_error) rows.push({ kind: 'account', code: '', title: '扫描失败', status: 'error', message: a.growth_error });
     if (a.skipped) rows.push({ kind: 'account', code: '', title: '已跳过', status: 'skipped', message: a.skip_reason || '该账号不适用当前自动任务' });
-    if (rows.length) groups.push({ uid: a.uid, nick: a.nickname, rows });
+    if (rows.length) groups.push({ uid: a.uid, nick: acctName(a), rows });
   }
   return groups;
 }
@@ -2508,7 +2513,7 @@ function updateProgress(q) {
 function groupsFromQueue(items) {
   const by = new Map();
   for (const it of items) {
-    if (!by.has(it.uid)) by.set(it.uid, { uid: it.uid, nick: it.nickname, rows: [] });
+    if (!by.has(it.uid)) by.set(it.uid, { uid: it.uid, nick: aliasForUid(it.uid) || it.nickname, rows: [] });
     by.get(it.uid).rows.push({
       kind: it.kind, code: it.code, title: it.title || '',
       prog: '',
@@ -2717,7 +2722,7 @@ function renderUsageDim() {
       x,
       isAcct ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
       m.withPerf,
-      isAcct ? remarkName(x.key, esc(key)) : '');
+      isAcct ? esc(aliasForUid(x.key) || key) : '');
   }).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
 }
@@ -2755,10 +2760,10 @@ function renderCreditDim() {
     const accounts = d.credit_by_account || [];
     $('usCreditBody').innerHTML = accounts.map(row => {
       const uid = String(row.key || '');
-      const account = row.nickname || uid.slice(0, 8) || '—';
+      const account = aliasForUid(uid) || row.nickname || uid.slice(0, 8) || '—';
       return '<tr>' +
         '<td class="mark" aria-hidden="true"></td>' +
-        '<td>' + remarkName(uid, esc(account)) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
+        '<td>' + esc(aliasForUid(uid) || account) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
         '<td class="num">' + fmtTok(row.requests) + '</td>' +
         '<td class="num">' + fmtCredit(row.credits) + '</td>' +
         '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
@@ -3304,7 +3309,7 @@ function pkAccountSegments(a, now) {
       days: expiresAt == null ? null : Math.max(0, Math.ceil((expiresAt - now) / PK_DAY_MS)),
       source: p.name || '积分',
       uid: String(a.uid || ''),
-      accountName: a.nickname || String(a.uid || '').slice(0, 8) || '未命名账号',
+      accountName: acctName(a),
     });
     balance -= amount;
   }
@@ -3370,7 +3375,7 @@ function renderExpiryDistribution(list, now) {
   const legend = (list || []).filter(a =>
     a && !a.error && a.uid && pkAccountSegments(a, now).some(s => s.days != null)
   ).map(a => '<span><i style="background:' + (colors.get(String(a.uid)) || 'var(--accent)') +
-    '"></i>' + esc(a.nickname || String(a.uid).slice(0, 8)) + '</span>').join('');
+    '"></i>' + esc(acctName(a)) + '</span>').join('');
   const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span style="text-align:center">各账号该批剩余</span><b>剩余积分</b></div>';
   $('pkExpiry').innerHTML = (rows
     ? hdr + '<div class="pk-expiry-chart">' + rows + '</div>'
@@ -3450,7 +3455,7 @@ function renderPackages(d, detailLimit) {
   $('pkSummary').innerHTML = list.map(a => {
     if (a.error) {
       return '<div class="pk-card"><div class="who"><span class="nm">' +
-        esc((a.nickname || a.uid.slice(0, 8))) + '</span>' +
+        esc(acctName(a)) + '</span>' +
         '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
         '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
     }
@@ -3466,7 +3471,7 @@ function renderPackages(d, detailLimit) {
       (s.minCreated ? ' · 首发 ' + esc(s.minCreated.slice(5)) : '') + '</span>'
     ).join('');
     return '<div class="pk-card">' +
-      '<div class="who"><span class="nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+      '<div class="who"><span class="nm">' + esc(acctName(a)) + '</span>' +
       '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
       '<div class="big">' + fmtTok(a.remain) + '</div>' +
       '<div class="sub">共 ' + fmtTok(a.size) + ' · ' + (a.packages || []).length +
@@ -3517,7 +3522,7 @@ function renderPackages(d, detailLimit) {
         groups.used.map(p => rowOf(p, 'used')).join('')
       : '';
     return '<div class="box"><header><h3>' +
-      esc(a.nickname || a.uid.slice(0, 8)) + ' · ' + esc(a.realm || '') +
+      esc(acctName(a)) + ' · ' + esc(a.realm || '') +
       '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
       ' / 总额 ' + fmtTok(a.size) + ' · 可用 ' + (groups.visible.length + groups.rest.length) + ' 个包' +
       (groups.used.length ? ' / 已用完 ' + groups.used.length + ' 个' : '') +
@@ -3637,7 +3642,7 @@ function renderExpirySnapshot(d) {
     const sub = (rest ? '<div class="note">' + rest + '</div>' : '') +
       (week > first.remain ? '<div class="note">7 天内合计 ' + fmtTok(week) + '</div>' : '');
     return '<tr' + (hidden ? ' data-exp-row="rest" hidden' : '') + '>' +
-      '<td>' + esc(a.nickname || String(a.uid || '').slice(0, 8)) + '</td>' +
+      '<td>' + esc(acctName(a)) + '</td>' +
       '<td>' + esc(first.date) + sub + '</td>' +
       '<td class="num" style="color:' + color + '">' +
         (days === 0 ? '今天' : days === 1 ? '明天' : days + ' 天') + '</td>' +
@@ -3902,7 +3907,7 @@ async function loadSchoolVouchers() {
     const ok = arr.filter(a => !a.error);
     const total = ok.reduce((n, a) => n + (a.vouchers || []).length, 0);
     body.innerHTML = ok.filter(a => (a.vouchers || []).length).map(a =>
-      '<div class="vc-acct"><span class="nm">' + esc(a.nickname || a.uid) + '</span>' +
+      '<div class="vc-acct"><span class="nm">' + esc(acctName(a)) + '</span>' +
       '<span>' + a.vouchers.length + ' 张</span></div>' +
       a.vouchers.map(vcCard).join('')
     ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
@@ -3910,7 +3915,7 @@ async function loadSchoolVouchers() {
     const errs = arr.filter(a => a.error);
     if (errs.length) {
       body.insertAdjacentHTML('beforeend', '<div class="note" style="color:var(--warn);margin-top:8px">查询失败：' +
-        errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(a.error) + '）').join('、') + '</div>');
+        errs.map(a => esc(acctName(a)) + '（' + esc(a.error) + '）').join('、') + '</div>');
     }
     body.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
       try { await copyText(b.dataset.copy); toast('券码已复制', 'ok'); }
@@ -3969,78 +3974,74 @@ async function loadPackages(force) {
 // 「刷新」始终实时查：必须显式 force —— 直接 `onclick = loadPackages` 会把事件对象当真值传进去，恒等于强刷。
 if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
 
-/* ══ 账号备注（只写本机 localStorage；账号池 / 用量两个视图共用同一份映射）══════
-   键取 uid 前 8 位——与 renderUsageDim 账号维度的 key 和积分扣除表的 uid 前缀同源，
-   三个表格因此都能直接 join。展示层只替换文本并挂 .rm-ghost 虚体，账号标识本身
-   仍由服务端下发，不写回后端；备注是纯展示层信息，不参与选号 / 计费 / 鉴权。 */
-function remarksAll() {
-  if (remarksCache) return remarksCache;
-  try { remarksCache = JSON.parse(localStorage.getItem(LS_REMARKS)) || {}; }
-  catch (e) { remarksCache = {}; }
-  return remarksCache;
+/* ══ 账号备注（服务端 state.json alias；账号池 / 用量 / 到期 / 任务 / 套餐共用）══════
+   alias 是本地 UI 元数据，与上游 nickname 独立：昵称同步不覆盖；所有账号视图
+   统一走 acctName，避免同名账号无法辨认。行内编辑只写 accounts/{uid}/alias。 */
+function acctName(a) {
+  if (!a) return '未命名账号';
+  const alias = String(a.alias || aliasForUid(a.uid) || '').trim();
+  if (alias) return alias;
+  const nick = String(a.nickname || '').trim();
+  if (nick) return nick;
+  return String(a.uid || '').slice(0, 8) || '未命名账号';
 }
-function remarkKey(uid) { return String(uid == null ? '' : uid).slice(0, 8); }
-function remarkOf(uid) {
-  const k = remarkKey(uid);
-  return k ? String(remarksAll()[k] || '') : '';
-}
-/* nameHtml 必须是已转义的 HTML；有备注时返回「备注 + 原标识（浅色虚体）」 */
-function remarkName(uid, nameHtml) {
-  const r = remarkOf(uid);
-  return r ? esc(r) + '<span class="rm-ghost">' + nameHtml + '</span>' : nameHtml;
-}
-// 返回是否真的落盘：localStorage 在隐私模式/配额满时会抛，吞掉就等于「界面说保存了、
-// 刷新后全没了」。调用方必须把 false 报出去。
-function storeRemarks(map) {
-  remarksCache = map;
-  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); return true; } catch (e) { return false; }
+// 从最近一次 overview 快照里查 uid 对应的本地备注名（用量/任务/套餐等
+// 按 uid 聚合的视图没有完整账号对象时用）。
+function aliasForUid(uid) {
+  const list = (overviewData && overviewData.accounts) || [];
+  const a = list.find(x => String(x.uid) === String(uid));
+  return a ? String(a.alias || '').trim() : '';
 }
 
-/* 编辑器的行来自 overview 缓存（账号池加载过就有），另外补上「已有备注但当前列表里
-   没有」的键，避免账号被移除后备注看起来凭空消失。 */
-function remarkFormRows() {
-  const rows = ((overviewData && overviewData.accounts) || [])
-    .map(s => ({ uid: remarkKey(s.uid), who: s.nickname || remarkKey(s.uid) }))
-    .filter(r => r.uid);
-  for (const k of Object.keys(remarksAll())) {
-    if (!rows.some(r => r.uid === k)) rows.push({ uid: k, who: k });
-  }
-  return rows;
-}
-function renderRemarkBody() {
-  const box = $('remarkBody');
-  if (!box) return;
-  const rows = remarkFormRows();
-  box.innerHTML = rows.length
-    ? rows.map(r => '<div class="rm-row"><span class="rm-who" title="' + esc(r.who) + '">' + esc(r.who) + '</span>' +
-        '<input type="text" data-uid="' + esc(r.uid) + '" value="' + esc(remarksAll()[r.uid] || '') + '" placeholder="备注（留空即清除）" maxlength="24"></div>').join('')
-    : '<div class="empty">暂无账号：先在「账号池」加载一次账号列表。</div>';
-}
-function openRemarks() {
-  renderRemarkBody();
-  if ($('remarkVeil')) $('remarkVeil').classList.add('on');
-}
-function closeRemarks() { if ($('remarkVeil')) $('remarkVeil').classList.remove('on'); }
-function saveRemarkForm() {
-  const map = {};
-  document.querySelectorAll('#remarkBody input[data-uid]').forEach(inp => {
-    const v = inp.value.trim();
-    if (v) map[inp.getAttribute('data-uid')] = v;
+// 昵称就地编辑：点击账号名 → 行内输入框；Enter/失焦保存，Esc 取消。
+// 备注名只写本地 state.json（accounts/{uid}/alias），不影响上游昵称。
+const accBodyEl = $('accBody');
+if (accBodyEl && accBodyEl.addEventListener) accBodyEl.addEventListener('click', ev => {
+  const nm = ev.target.closest('.nm.alias-edit');
+  if (!nm || nm.querySelector('input')) return;
+  startAliasEdit(nm);
+});
+
+function startAliasEdit(nm) {
+  aliasEditing = true;
+  const uid = nm.dataset.aliasUid;
+  const cur = nm.dataset.aliasVal || '';
+  const nick = nm.dataset.aliasNick || '';
+  const html = nm.innerHTML;
+  const input = document.createElement('input');
+  input.className = 'alias-input';
+  input.value = cur;
+  input.placeholder = nick ? '备注名（留空清除）' : '备注名';
+  input.maxLength = 32;
+  nm.innerHTML = '';
+  nm.appendChild(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async save => {
+    if (done) return;
+    done = true;
+    aliasEditing = false;
+    if (!save) { nm.innerHTML = html; return; }
+    const val = input.value.trim();
+    if (val === cur) { nm.innerHTML = html; return; } // 未变化：不打扰后端
+    try {
+      await api('accounts/' + encodeURIComponent(uid) + '/alias', {
+        method: 'POST', body: JSON.stringify({ alias: val }),
+      });
+      toast(val ? '备注已保存' : '备注已清除', 'ok');
+      loadOverview(true);
+    } catch (e) {
+      toast(e.message, 'err');
+      nm.innerHTML = html;
+    }
+  };
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
   });
-  const saved = storeRemarks(map);
-  closeRemarks();
-  // 备注只影响本机展示：重渲染当前视图即可，无需后端参与。
-  if (view === 'accounts') loadOverview(true);
-  else if (view === 'usage' && usageData) renderUsage(usageData);
-  toast(saved ? '备注已保存（仅本机浏览器）' : '备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失', saved ? '' : 'err');
+  input.addEventListener('blur', () => finish(true));
 }
-if ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;
-if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
-if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => {
-  if (!storeRemarks({})) toast('清空未能写入浏览器存储，刷新后备注会回来', 'err');
-  renderRemarkBody();
-};
-if ($('btnRemarkSave')) $('btnRemarkSave').onclick = saveRemarkForm;
 
 /* 账号身份色板（8 槽）。槽位 0 = var(--accent)（**主题主色**，浅色主题下
    自动跟随；刻意保留，因为它承载的是"第一条线=当前主题强调色"的既有语义，

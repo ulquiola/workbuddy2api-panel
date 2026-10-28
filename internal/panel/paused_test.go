@@ -113,7 +113,7 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function renderAccounts('), end = src.indexOf('async function loadOverview(');
 assert.ok(start >= 0 && end > start, 'renderAccounts not found');
 const tb = { innerHTML: '' };
-const ctx = {
+const ctx = { acctName: a => String((a && (a.alias || a.nickname)) || (a && a.uid) || ''), aliasForUid: () => '', aliasEditing: false, 
   String, Number, Math, Date, Object, Array, JSON, RegExp, console,
   $: id => (id === 'accBody' ? tb : null),
   setHTML: (el, html) => { el.innerHTML = html; },

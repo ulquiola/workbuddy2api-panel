@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/balance"
@@ -244,6 +245,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.withAuth(p.addAPIKey))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/alias", p.withAuth(p.accountAlias))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
@@ -932,6 +934,30 @@ func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.Revive(uid)
 	log.Printf("panel: revive uid=%s（人工清除禁用/冷却/熔断）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountAlias 设置本地备注名（面板就地编辑；不写 auth 文件、不触达上游）。
+// 空字符串 = 清除；最长 32 个字符（按 rune 计，避免中文被字节长度误伤）。
+func (p *Panel) accountAlias(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	var body struct {
+		Alias string `json:"alias"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	alias := strings.TrimSpace(body.Alias)
+	if utf8.RuneCountInString(alias) > 32 {
+		writeErr(w, http.StatusBadRequest, "alias too long (max 32 chars)")
+		return
+	}
+	if !p.cfg.Pool.SetAlias(uid, alias) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: alias uid=%s -> %q", uid, alias)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "alias": alias})
 }
 
 // accountDisable 人工禁用（不再参与选号，需面板 revive 或重登恢复）。

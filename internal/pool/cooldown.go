@@ -54,6 +54,24 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 	return true
 }
 
+// SetAlias 设置本地备注名（面板就地编辑）。空字符串 = 清除备注。
+// 与 SetNickname 的区别：alias 是纯本地 UI 元数据，不写 auth 文件、不触达上游；
+// 持久化在 state.json（stateAccount.Alias），昵称同步 / 凭证刷新都不会覆盖它。
+// 返回 false 表示账号不存在（与「值未变化」无关）；落盘由 dirty/flusher 负责。
+func (p *Pool) SetAlias(uid, alias string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	if e.alias != alias {
+		e.alias = alias
+		p.dirty.Store(true)
+	}
+	return true
+}
+
 // NoteCheckinDone 标记账号今日已签到（签到成功与上游"今天已签到"幂等拒绝均算）。
 // 记录本地日期，跨零点自然过期；不触碰冷却/禁用状态（签到与冷却域正交）。
 func (p *Pool) NoteCheckinDone(uid string) {
