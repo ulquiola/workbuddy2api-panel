@@ -31,6 +31,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/httpauth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/scheduler"
 	"github.com/misakano7545/workbuddy2api-panel/internal/updater"
@@ -41,6 +42,7 @@ import (
 // Config 面板依赖（main 装配注入）。
 type Config struct {
 	Pool      *pool.Pool
+	ProxyPool *proxypool.Manager
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	// AutoTasksEnabled 与成长任务开关共用热配置；nil 时只允许手动启动后台任务。
@@ -95,10 +97,11 @@ type Config struct {
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
 // 本 mux 的 pattern 均带 /panel 前缀（外层不做前缀剥离）。
 type Panel struct {
-	cfg     Config
-	mux     *http.ServeMux
-	started time.Time
-	logs    *Ring
+	proxyAccountMu sync.Mutex
+	cfg            Config
+	mux            *http.ServeMux
+	started        time.Time
+	logs           *Ring
 
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
@@ -111,6 +114,12 @@ type Panel struct {
 	// 不同账号之间不互斥（并行照旧）。TryLock 语义，锁条目常驻（账号数有界）。
 	taskMu    sync.Mutex
 	taskLocks map[string]*sync.Mutex
+
+	// softRateMu/softRateUntil 上游软限流（429）的账号级冷却截止：撞过一次就记下来，
+	// 同一轮里后续任务动作直接快失败，不每个动作都再睡一遍——一轮全量任务有几十个
+	// 动作，逐个睡会让后台作业卡住几十分钟，还占着 taskLocks 把手动触发一起堵死。
+	softRateMu    sync.Mutex
+	softRateUntil map[string]time.Time
 
 	// batchRunning 手动全量运维接口（签到/旅行/活跃/保活/余额）共用的防重入闸门：
 	// 这些动作都是逐号打上游，并发跑两轮 = 每号至少翻倍上游请求，正是批间节流
@@ -233,81 +242,84 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/theme.js", p.themeScript)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
-	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
-	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
-	p.mux.HandleFunc("GET /panel/api/error_summary", p.withAuth(p.errorSummary))
-	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
-	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
-	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
-	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/overview", p.overview)
+	p.proxyRoutes()
+	p.mux.HandleFunc("GET /panel/api/logs", p.logsHandler)
+	p.mux.HandleFunc("GET /panel/api/error_summary", p.errorSummary)
+	p.mux.HandleFunc("GET /panel/api/request_metrics", p.requestMetrics)
+	p.mux.HandleFunc("GET /panel/api/request_logs", p.requestLogs)
+	p.mux.HandleFunc("GET /panel/api/credit_history", p.creditHistory)
+	p.mux.HandleFunc("GET /panel/api/models", p.models)
 	// (账号 × 模型) 手动开关：运维显式禁用某账号的某模型（永久语义，仅手动解）。
 	// 与上游触发的临时冷却（6004/11102）正交，且手动优先。
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/model_toggle", p.withAuth(p.modelToggle))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/model_toggle", p.modelToggle)
 	// 封禁账号探活：只读探测上游是否已解封，不 revive、不参与选号。
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/probe_ban", p.withAuth(p.accountProbeBan))
-	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
-	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
-	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
-	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
-	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.withAuth(p.addAPIKey))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/alias", p.withAuth(p.accountAlias))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
-	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/claim", p.withAuth(p.accountTaskClaim))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto", p.withAuth(p.accountTaskAuto))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto_all", p.withAuth(p.accountTaskAutoAll))
-	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAuth(p.tasksScanAll))
-	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
-	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
-	p.mux.HandleFunc("GET /panel/api/tasks/jobs", p.withAuth(p.taskJobsHandler))
-	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks/job", p.withAuth(p.taskJobStatus))
-	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
-	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/travel", p.withAuth(p.accountTravel))
-	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
-	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
-	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
-	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
-	p.mux.HandleFunc("GET /panel/api/balance_history", p.withAuth(p.balanceHistory))
-	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
-	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
-	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
-	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
-	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
-	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
-	p.mux.HandleFunc("POST /panel/api/model_hidden", p.withAuth(p.setModelHidden))
-	p.mux.HandleFunc("POST /panel/api/model_effort", p.withAuth(p.setModelEffort))
-	p.mux.HandleFunc("GET /panel/api/update", p.withAuth(p.updateStatus))
-	p.mux.HandleFunc("POST /panel/api/update/check", p.withAuth(p.checkUpdate))
-	p.mux.HandleFunc("POST /panel/api/update/install", p.withAuth(p.installUpdate))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/probe_ban", p.accountProbeBan)
+	p.mux.HandleFunc("POST /panel/api/login/start", p.loginStart)
+	p.mux.HandleFunc("GET /panel/api/login/poll", p.loginPoll)
+	p.mux.HandleFunc("GET /panel/api/login/regions", p.loginRegions)
+	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.importCockpit)
+	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.addAPIKey)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.accountRevive)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.accountDisable)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/alias", p.accountAlias)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.accountPause)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.accountResume)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.accountCheckin)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.accountBalance)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.accountRemove)
+	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.accountTasks)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.accountTaskAccept)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.taskAcceptAll)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/claim", p.accountTaskClaim)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto", p.accountTaskAuto)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto_all", p.accountTaskAutoAll)
+	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.tasksScanAll)
+	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.tasksRunQueue)
+	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.tasksQueueStatus)
+	p.mux.HandleFunc("GET /panel/api/tasks/jobs", p.taskJobsHandler)
+	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks/job", p.taskJobStatus)
+	p.mux.HandleFunc("POST /panel/api/checkin_all", p.checkinAll)
+	p.mux.HandleFunc("POST /panel/api/travel_all", p.travelAll)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/travel", p.accountTravel)
+	p.mux.HandleFunc("POST /panel/api/activity_all", p.activityAll)
+	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.keepaliveAll)
+	p.mux.HandleFunc("POST /panel/api/balance_all", p.balanceAll)
+	p.mux.HandleFunc("GET /panel/api/packages", p.packages)
+	p.mux.HandleFunc("GET /panel/api/balance_history", p.balanceHistory)
+	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.schoolVouchers)
+	p.mux.HandleFunc("GET /panel/api/usage", p.usage)
+	p.mux.HandleFunc("POST /panel/api/usage/save", p.usageSave)
+	p.mux.HandleFunc("GET /panel/api/model_probes", p.modelProbes)
+	p.mux.HandleFunc("GET /panel/api/config", p.getConfig)
+	p.mux.HandleFunc("POST /panel/api/config", p.saveConfig)
+	p.mux.HandleFunc("POST /panel/api/model_hidden", p.setModelHidden)
+	p.mux.HandleFunc("POST /panel/api/model_effort", p.setModelEffort)
+	p.mux.HandleFunc("GET /panel/api/update", p.updateStatus)
+	p.mux.HandleFunc("POST /panel/api/update/check", p.checkUpdate)
+	p.mux.HandleFunc("POST /panel/api/update/install", p.installUpdate)
+}
+
+// publicPanelPaths 免鉴权的精确路径：静态页面与脚本本身不含秘密，其余一律要密钥。
+var publicPanelPaths = map[string]struct{}{
+	"/panel/":         {},
+	"/panel/theme.js": {},
+	"/panel/app.js":   {},
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
 // 与 401 错误响应全都带上（API 也可能在浏览器里被直接打开）。
+//
+// 鉴权在这里默认拒绝，而不是逐条包在路由上：逐条包的话，新增一条路由忘了包
+// 就是静默公开；这里的失效方向是「忘了登记白名单 → 401」，看得见。
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	p.mux.ServeHTTP(w, r)
-}
-
-// withAuth 与 server 包同口径的 Bearer 鉴权（经 httpauth 常量时间比较）；
-// api_key 为空时放行。密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求
-// 即用新值（无需重启）。
-func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, p.apiKey()) {
-			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
-			return
-		}
-		next(w, r)
+	if _, ok := publicPanelPaths[r.URL.Path]; !ok && !httpauth.VerifyBearer(r, p.apiKey()) {
+		// 密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求即用新值。
+		writeErr(w, http.StatusUnauthorized, "invalid_api_key")
+		return
 	}
+	p.mux.ServeHTTP(w, r)
 }
 
 // apiKey 当前生效密钥（Live 优先，回落静态字段）。
@@ -369,6 +381,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 模型降级路由表：前端据它标注「⤳ 已路由至 X」（限流的模型若配了等价模型）。
 		"model_fallback": p.modelFallbackSnapshot(),
 		"accounts":       p.cfg.Pool.List(),
+		"proxy_pool":     p.proxySnapshot(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久，移植上游
 		// PR #120）：与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -427,11 +440,29 @@ func (p *Panel) updateSnapshot() any {
 // ?since=<RFC3339> 时只返回**该时刻之后**的条目（增量拉取）。面板「运行日志」页
 // 每 5 秒拉一次全量（500 行，~90KB），绝大多数轮次这 500 行根本没变。
 //
+// 增量优先认 ?since_seq=<uint64>（只回 Seq 更大的条目）——这是**唯一可靠**的游标：
+// TS 在同一时钟刻度内的多次写入完全相同（Windows 实测 ~15.6ms 粒度，一次 Write
+// 的多行 + 背靠背的多次 Write 都会撞），按 TS 过滤必然要么重复、要么整批漏掉。
+// 连「带纳秒的原始 TS 串」也救不了同一刻度内的多条。
+//
+// ?since 保留兼容（旧前端 / 手工 curl），语义仍是「TS 严格晚于 since」。
+//
 // 语义与全量一致：响应仍是 {entries, archive_error}，前端把新条目追加到已有列表。
 // 游标过期时客户端自己做一次全量拉（环形缓冲淘汰最旧行时，被淘汰的行不会再来）。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 	entries := p.logs.Snapshot()
-	if raw := r.URL.Query().Get("since"); raw != "" {
+	q := r.URL.Query()
+	if raw := q.Get("since_seq"); raw != "" {
+		if since, ok := parseSeqParam(raw); ok {
+			filtered := entries[:0:0] // 新切片：不改 Snapshot 返回的底层数组
+			for _, e := range entries {
+				if e.Seq > since {
+					filtered = append(filtered, e)
+				}
+			}
+			entries = filtered
+		}
+	} else if raw := q.Get("since"); raw != "" {
 		if since, ok := parseSinceParam(raw); ok {
 			filtered := entries[:0:0] // 新切片：不改 Snapshot 返回的底层数组
 			for _, e := range entries {
@@ -443,6 +474,19 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "archive_error": p.logs.ArchiveError()})
+}
+
+// parseSeqParam 解析 ?since_seq=。
+//
+// 非法值回落全量（与 parseSinceParam 同口径：宁可多给不可少给）。
+// seq 初值是启动时刻的毫秒数（见 NewRing），远大于 0，故 since_seq=0 等价于
+// 全量——正是首次加载想要的语义。
+func parseSeqParam(raw string) (uint64, bool) {
+	v, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // parseSinceParam 解析 ?since= 参数。
@@ -614,7 +658,14 @@ func (p *Panel) nicknames() map[string]string {
 // （有错误明细回 502，一个账号都没有回 503）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
-	var fetchErrs []string
+	// catalogErrs = 目录探测失败（决定「整份视图是否可信」→ 报 502 / 不写缓存）；
+	// busyErrs = 繁忙度观测失败（**只是少一列**，目录本身已经拿到）。
+	//
+	// 两者必须分开：此前只有 fetchErrs 一个切片，国际版 /v2/chat/busy 恒 404（见
+	// upstream/modelbusy.go）就永久占着一条错误，于是 `len(fetchErrs)==0` 的写缓存条件
+	// 永远不成立——只要池里有 global 账号，模型目录缓存完全失效，面板每次刷新都实打上游。
+	var catalogErrs []string
+	var busyErrs []string
 
 	// refresh=1：强制重探 global 目录（issue #216 现象 3）。此前按钮只是重读 1h 缓存，
 	// 上游目录变了也纹丝不动。CN 侧本来就是每请求直连上游（无缓存），无需处理。
@@ -639,7 +690,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			cnAcct = acct
 			infos, err := p.cfg.Upstream.FetchModels(acct)
 			if err != nil {
-				fetchErrs = append(fetchErrs, "cn: "+err.Error())
+				catalogErrs = append(catalogErrs, "cn: "+err.Error())
 			} else {
 				for _, mi := range infos {
 					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
@@ -656,7 +707,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 				globalAcct = acct
 				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
 				if len(infos) == 0 {
-					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
+					catalogErrs = append(catalogErrs, "global: 上游未返回可用模型")
 				} else {
 					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
 					for _, mi := range infos {
@@ -737,8 +788,8 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 模型繁忙度（官方 /v2/chat/busy，只读观测，见 upstream/modelbusy.go）：与目录同一批
-	// 账号查，附到对应域的行上。查不到就不填字段（不编造）；失败只并入 fetchErrs（目录本身
-	// 已经拿到了，不该因为繁忙度查询失败把整个视图打成 502）。
+	// 账号查，附到对应域的行上。查不到就不填字段（不编造）；失败只并入 busyErrs（目录本身
+	// 已经拿到了，不该因为繁忙度查询失败把整个视图打成 502，更不该阻断目录缓存）。
 	for realm, acct := range map[string]*auth.Auth{"cn": cnAcct, "global": globalAcct} {
 		if acct == nil {
 			continue
@@ -755,7 +806,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 		levels, err := p.cfg.Upstream.ModelBusy(acct, ids)
 		if err != nil {
-			fetchErrs = append(fetchErrs, realm+" busy: "+err.Error())
+			busyErrs = append(busyErrs, realm+" busy: "+err.Error())
 			continue
 		}
 		for _, e := range out {
@@ -768,15 +819,16 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(out) == 0 {
-		if len(fetchErrs) > 0 {
-			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
+		if errs := append(append([]string{}, catalogErrs...), busyErrs...); len(errs) > 0 {
+			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(errs, "; "))
 			return
 		}
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
 	globalSource := p.cfg.Upstream.GlobalCatalogSource()
-	if len(fetchErrs) == 0 {
+	// 只有目录错误才拒绝写缓存；繁忙度失败不阻断（否则国际版恒 404 会让缓存永久失效）。
+	if len(catalogErrs) == 0 {
 		p.storeModelsCache(&modelsCacheEntry{models: out, globalSource: globalSource})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -786,6 +838,9 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		// 前端据此提示「拿到的是回落/降级目录」——issue #216 里用户只看到「少了 11 个模型」，
 		// 完全不知道已经降级到企业端点（那份目录只有 18 条、hy4-preview 的倍率还是旧值）。
 		"global_source": globalSource,
+		// busy_errs 繁忙度观测失败明细（目录不受影响）：国际版没有 /v2/chat/busy，
+		// 首轮会在这里出现一条，之后按域短路不再产生。
+		"busy_errs": busyErrs,
 	})
 }
 
@@ -1137,7 +1192,19 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
+	p.proxyAccountMu.Lock()
+	defer p.proxyAccountMu.Unlock()
 	uid := r.PathValue("uid")
+	if p.cfg.Pool.AuthByUID(uid) == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if p.cfg.ProxyPool != nil {
+		if err := p.cfg.ProxyPool.Unbind(uid); err != nil {
+			writeErr(w, http.StatusInternalServerError, "save account proxy binding failed")
+			return
+		}
+	}
 	a := p.cfg.Pool.Remove(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")

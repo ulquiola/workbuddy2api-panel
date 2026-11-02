@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -97,6 +98,31 @@ func doFallbackChat(h *Handler, model string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 	return rec
+}
+
+func TestModelFallbackRespectsModelPolicy(t *testing.T) {
+	for _, hidden := range []bool{false, true} {
+		t.Run(fmt.Sprint("hidden=", hidden), func(t *testing.T) {
+			up := &modelAwareUpstream{reply: []struct {
+				status int
+				body   string
+			}{
+				{429, rateLimit6004Body}, {200, okChatSSE},
+			}}
+			h := newFallbackHandler(map[string]string{"model-a": "model-b"}, up.client())
+			if hidden {
+				h.cfg.ModelsHidden = []string{"model-b"}
+			} else {
+				h.cfg.ModelsAllowed = []string{"model-a"}
+			}
+			doFallbackChat(h, "model-a")
+			for _, model := range up.seen() {
+				if model == "model-b" {
+					t.Fatal("fallback bypassed model policy")
+				}
+			}
+		})
+	}
 }
 
 // TestModelFallbackOn6004 核心行为：v4.1 被 6004 → 同账号改用 v4 → 成功。
@@ -259,5 +285,40 @@ func TestModelFallbackWhenNoAccountForModel(t *testing.T) {
 	}
 	if got := up.seen(); len(got) != 1 || got[0] != "deepseek-v4-flash" {
 		t.Fatalf("应直接改用等价模型，实际上游收到 %v", got)
+	}
+}
+
+// TestModelFallbackRealmPrefixedKey 带域前缀的键（"global:x"/"cn:x"）必须按域生效。
+//
+// 实案（2026-10-25）：config.json 配 {"global:deepseek-v4.1-flash": "deepseek-v4.1-flash-sg"}，
+// 但 model_fallback 从配置到查找端原样透传（没有 models.aliases 那样的归一化），
+// 旧查找只查裸名 m["deepseek-v4.1-flash"] → 前缀键整表失效，global 域 6004 后
+// 完全没有降级，请求直接 429。Config.ModelFallback 的注释与面板都承诺「裸名或
+// 带域前缀均可」，所以这是实现与契约不一致，不是用法问题。
+func TestModelFallbackRealmPrefixedKey(t *testing.T) {
+	up := &modelAwareUpstream{reply: []struct {
+		status int
+		body   string
+	}{
+		{429, rateLimit6004Body}, // 原模型 6004
+		{200, okChatSSE},         // 降级目标成功
+	}}
+	// 前缀键只在对应域生效：用 global 账号 + global 键，避免「裸名两域通用」混淆结论。
+	p := testPoolWith(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "at-g1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool:      p,
+		Upstream:  up.client(),
+		MaxRotate: 3,
+		ModelFallback: func() map[string]string {
+			return map[string]string{"global:deepseek-v4.1-flash": "deepseek-v4.1-flash-sg"}
+		},
+	})
+	rec := doFallbackChat(h, "global:deepseek-v4.1-flash")
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200（前缀键降级后应成功），body=%s", rec.Code, rec.Body)
+	}
+	if got := up.seen(); len(got) != 2 || got[0] != "deepseek-v4.1-flash" || got[1] != "deepseek-v4.1-flash-sg" {
+		t.Fatalf("前缀键应触发 global 域降级，上游收到 %v", got)
 	}
 }

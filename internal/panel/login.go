@@ -11,11 +11,13 @@ package panel
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,8 +29,8 @@ import (
 )
 
 const (
-	// clientUA 设备授权链路 UA（与授权链接 version 参数同源，官方口径集中在
-	// internal/loginsite，避免面板与 cmd/login 各写一份）。
+	// clientUA 保留仅为兼容既有测试引用；设备码端点实际 UA 按站点取
+	// （loginsite.Site.UserAgent → EndpointHeaders），登录链路已不再发 CodeBuddy CLI 串。
 	clientUA = loginsite.ClientUA
 )
 
@@ -90,16 +92,76 @@ func (e *loginEnvelopeError) Error() string {
 	return fmt.Sprintf("code=%d msg=%s", e.Code, e.Msg)
 }
 
-// loginHTTP 设备授权专用 client：短超时、无 cookie（每请求携带 state，无会话态）。
-var loginHTTP = &http.Client{Timeout: 30 * time.Second}
+// loginHTTP 设备授权专用 client：无 cookie（每请求携带 state，无会话态）。
+//
+// ⚠️ 为什么不能直接用默认 transport（2026-10-24 实案，处置与
+// internal/upstream/transport.go 同源）：
+// 默认 transport 会经 ALPN 协商出 HTTP/2，而本网络下容器 DNS（127.0.0.11）偶发
+// 「server misbehaving」并留下半死连接——半死 h2 流被复用时会一直等响应头，直到
+// 客户端**总超时**才报错：
+//
+//	auth state (upstream 0): Post "https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI":
+//	context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+//
+// 用户可见表现：国内版一直拿不到授权链接（国际版当时恰好没撞上抖动，看起来正常）；
+// 登录轮询走的 auth/token 是同一个 client，同样会卡——浏览器侧明明已登录成功，
+// 网关却迟迟检测不到，面板像卡死。
+//
+// 两层防护（与 newTransport 一致）：
+//   - TLS 层：空 TLSNextProto 真正禁 h2（必须 make 而非 nil；只设
+//     ForceAttemptHTTP2=false 无效，ALPN 仍会协商出 h2，见 transport.go 注释）；
+//   - 连接层：DialContext 8s 建连 + 15s keepalive、TLS 握手 8s、响应头 15s，
+//     让单次尝试在 ~15s 内失败而不是拖满 30s 总超时，配合下方 doJSON 重试。
+var loginHTTP = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   8 * time.Second,
+			KeepAlive: 15 * time.Second,
+		}).DialContext,
+		TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		TLSHandshakeTimeout:   8 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		MaxIdleConns:          16,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       60 * time.Second,
+	},
+}
 
-func commonHeaders(req *http.Request, origin string) {
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", origin)
-	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", clientUA)
+// commonHeaders 设备码端点的公共头族（真机形态，见 loginsite.Site.EndpointHeaders）。
+//
+// 不再发 Origin / Referer / X-Requested-With：2026-10-30 双版本真机抓包显示这三条
+// 端点（auth/state、auth/token、login/account）由桌面端 node fetch 发出，恒无这三个头
+// ——浏览器同源语义只出现在「打开授权页」那一步，不在 API 调用上。
+//
+// 三端点的**差异头**（x-domain / x-no-* / x-device-token / Authorization）由
+// stateHeaders / tokenHeaders / accountHeaders 三个包装补，不要在这里抹平。
+func commonHeaders(req *http.Request, site loginSite) {
+	applyHeaders(req, site.EndpointHeaders())
+}
+
+// applyHeaders 把 map 头批量写到 req（空值跳过，避免发出空头）。
+func applyHeaders(req *http.Request, h map[string]string) {
+	for k, v := range h {
+		if v != "" {
+			req.Header.Set(k, v)
+		}
+	}
+}
+
+// stateHeaders POST /v2/plugin/auth/state 的头族（含 x-device-token 与哨兵）。
+func stateHeaders(site loginSite, deviceToken string) map[string]string {
+	return site.HeadersForState(deviceToken)
+}
+
+// tokenHeaders GET /v2/plugin/auth/token 的头族（真机唯一不带 x-domain 的端点）。
+func tokenHeaders(site loginSite) map[string]string {
+	return site.HeadersForToken()
+}
+
+// accountHeaders GET /v2/plugin/login/account 的头族（带 Bearer，x-no-authorization 缺席）。
+func accountHeaders(site loginSite, accessToken string) map[string]string {
+	return site.HeadersForAccount(accessToken)
 }
 
 // validUID 校验上游返回的 uid 是否可安全用于拼文件名。
@@ -126,16 +188,47 @@ type apiEnvelope struct {
 	Data json.RawMessage `json:"data"`
 }
 
-// doJSON 发一次 JSON 请求并解信封。origin 为 Origin/Referer 基础域（随 realm 切）。
-func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json.RawMessage, int, error) {
-	req, err := http.NewRequest(method, fullURL, body)
+// loginAttempts 单次登录步骤的传输层重试次数（只对「一个 HTTP 响应都没拿到」的
+// 失败重试）。理由见 loginHTTP：容器 DNS 偶发 server misbehaving，单发失败不该让
+// 用户从头再点一遍；且三步都可安全重发（auth/state 重签一个 state、旧 state 由
+// loginTTL 回收；token/account 是只读查询）。已拿到响应（业务错误如 token 的
+// 11217 "login ing"、或 HTTP 4xx/5xx）绝不重试——那是确定结果，重试只会拖慢轮询。
+const loginAttempts = 3
+
+// doJSON 发一次 JSON 请求并解信封，遇纯传输失败按 loginAttempts 重试。
+// site 决定头族与 UA（真机形态，见 commonHeaders）；extra 为端点差异头
+// （state 的 x-device-token / 哨兵、account 的 Bearer 等），在公共头之后覆盖写入，
+// nil 表示只发公共头。body 用 []byte 以便重放。
+func doJSON(method, fullURL string, extra map[string]string, body []byte, site loginSite) (json.RawMessage, int, error) {
+	var lastErr error
+	for attempt := 0; attempt < loginAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 400 * time.Millisecond)
+		}
+		data, status, err := doJSONOnce(method, fullURL, extra, body, site)
+		if err == nil {
+			return data, status, nil
+		}
+		if status != 0 {
+			return nil, status, err // 上游已应答：确定结果，不重试
+		}
+		lastErr = err
+	}
+	return nil, 0, lastErr
+}
+
+// doJSONOnce 单次尝试（不做重试）。
+func doJSONOnce(method, fullURL string, extra map[string]string, body []byte, site loginSite) (json.RawMessage, int, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, fullURL, rdr)
 	if err != nil {
 		return nil, 0, err
 	}
-	commonHeaders(req, origin)
-	if bearer != "" {
-		req.Header.Set("Authorization", "Bearer "+bearer)
-	}
+	commonHeaders(req, site)
+	applyHeaders(req, extra)
 	resp, err := loginHTTP.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -162,6 +255,28 @@ func loginDeviceNonce() string {
 	return strings.TrimSpace(os.Getenv("CODEBUDDY_LOGIN_DEVICE_NONCE"))
 }
 
+// loginDeviceToken 设备风控 token（X-Device-Token），用于 auth/state 的出站头。
+//
+// 真机（CN 5.9.3 / GL 5.9.4）该头恒为 `v3:<base64…>` 形态，由客户端 qimei 组件
+// 本地生成后加密上报，**不是**能从 machineId 推导出来的东西。网关拿不到就返回空串，
+// 调用方据此不发该头——伪造一个假 token 比缺这个头更容易被判定为非客户端。
+//
+// 取值来源（按优先级）：
+//
+//	CODEBUDDY_LOGIN_DEVICE_TOKEN 环境变量
+//	CODEBUDDY_LOGIN_DEVICE_TOKEN_FILE 指向的文件（宿主从桌面端落盘处导出）
+func loginDeviceToken() string {
+	if v := strings.TrimSpace(os.Getenv("CODEBUDDY_LOGIN_DEVICE_TOKEN")); v != "" {
+		return v
+	}
+	if p := strings.TrimSpace(os.Getenv("CODEBUDDY_LOGIN_DEVICE_TOKEN_FILE")); p != "" {
+		if b, err := os.ReadFile(p); err == nil {
+			return strings.TrimSpace(string(b))
+		}
+	}
+	return ""
+}
+
 // loginStart 发起设备授权：POST auth/state 拿授权 URL。
 // body 可带 {"site":"cn"|"intl"|"workbuddy"}（官方域表，缺省 cn）；
 // 兼容老前端 {"realm":"global"} → 旧桌面端 workbuddy.ai（零回归）。
@@ -182,8 +297,9 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	epState, _, _, origin := loginEndpointsFor(site)
-	data, status, err := doJSON(http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
+	epState, _, _, _ := loginEndpointsFor(site)
+	// auth/state：真机带 x-device-token（取到才发）+ x-custom-channel-id + 四个 x-no-*。
+	data, status, err := doJSON(http.MethodPost, epState, stateHeaders(site, loginDeviceToken()), []byte("{}"), site)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
 		return
@@ -265,13 +381,14 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		}
 		p.loginMu.Unlock()
 	}()
-	_, epToken, epAcct, origin := loginEndpointsFor(siteOrDefault(sess.site))
+	pollSite := siteOrDefault(sess.site)
+	_, epToken, epAcct, _ := loginEndpointsFor(pollSite)
 
 	// auth/token 是权威登录状态端点。官方码表语义：
 	//   11217（RetryFetchToken）→ 还没登完，继续轮询；
 	//   12005/11212/11216（席位满/许可证过期/试用到期）→ 终态，立刻把上游 msg
 	//   抛给前端并停轮询（官方 SignLicenseError 行为），不再空转到 TTL。
-	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, "", nil, origin)
+	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, tokenHeaders(pollSite), nil, pollSite)
 	if err != nil {
 		var envErr *loginEnvelopeError
 		if errors.As(err, &envErr) && loginCodeFatal(envErr.Code) {
@@ -311,7 +428,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
 	}
-	acctRaw, _, errAcct := doJSON(http.MethodGet, epAcct+state, tok.AccessToken, nil, origin)
+	acctRaw, _, errAcct := doJSON(http.MethodGet, epAcct+state, accountHeaders(pollSite, tok.AccessToken), nil, pollSite)
 	if errAcct == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	} else {
