@@ -157,6 +157,7 @@ func main() {
 	p.SetCreditFloorMaxRate(cfg.Pool.CreditFloorMaxRate) // 保底兜底的目录倍率上限（0 = 严格模式）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetReserveCredits(*cfg.Pool.ReserveCredits) // 保留积分：余额低于阈值停止接单（0 = 关闭，缺省 10）
+	p.SetReserveCreditsByRealm(cfg.Pool.ReserveCreditsByRealm)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring, cfg.ExpiringSoonDur)
 	p.SetAccountPriority(cfg.Pool.AccountPriority) // 账号优先级/占比（issue #62）：空表 = 不启用
 	p.SetAccountShare(cfg.Pool.AccountShare)
@@ -379,13 +380,14 @@ func main() {
 	// 模型白名单（issue #68）：启动时归一化一次，快照只读持有。
 	allowedModels, allowlistEnabled := livecfg.NormalizeAllowedModels(cfg.Models.Allowed)
 	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-		EmbeddingsEnabled:    cfg.Features.EmbeddingsEnabled,
-		RecordClientInfo:     cfg.Logging.RequestClientInfo,
-		RecordContext:        cfg.Logging.RequestArchiveContext,
-		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		APIKey:                cfg.APIKey,
+		SoftCooldown:          cfg.SoftRateDur,
+		SanitizeFingerprints:  cfg.Features.SanitizeBlacklistFingerprints,
+		EmbeddingsEnabled:     cfg.Features.EmbeddingsEnabled,
+		WatermarkStripEnabled: cfg.Features.WatermarkStripEnabled,
+		RecordClientInfo:      cfg.Logging.RequestClientInfo,
+		RecordContext:         cfg.Logging.RequestArchiveContext,
+		HiddenModels:          livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 		// 模型白名单（issue #68）：归一化集合 + 启用标志；空配置 = 不启用。
 		AllowedModels:    allowedModels,
 		AllowlistEnabled: allowlistEnabled,
@@ -509,6 +511,8 @@ func main() {
 		auditLog = al
 		log.Printf("admin audit: %s", al.Path())
 	}
+	// MCP serverInfo.version 与面板 /status 用同一个版本串（本地构建是 dev）。
+	server.BuildVersion = appVersion
 	gw = server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -545,6 +549,9 @@ func main() {
 		BudgetLimit:      cfg.Budget.DailyCreditLimit,
 		BurstCreditLimit: cfg.Budget.BurstCreditLimit,
 		CacheLowRate:     cfg.Budget.CacheLowRate,
+		// 入站请求体 OOM 护栏 + 11140 连坐暂停（两处都只在启动时读，改完需重启）。
+		MaxPayloadBytes: cfg.Server.MaxPayloadBytes,
+		RestrictionHold: time.Duration(cfg.Upstream.RestrictionHoldSeconds) * time.Second,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -856,13 +863,14 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 白名单同步重建（issue #68）：面板保存 models.allowed 后即时生效。
 	newAllowedModels, newAllowlistEnabled := livecfg.NormalizeAllowedModels(newCfg.Models.Allowed)
 	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-		EmbeddingsEnabled:    newCfg.Features.EmbeddingsEnabled,
-		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
-		RecordContext:        newCfg.Logging.RequestArchiveContext,
-		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+		APIKey:                newCfg.APIKey,
+		SoftCooldown:          newCfg.SoftRateDur,
+		SanitizeFingerprints:  newCfg.Features.SanitizeBlacklistFingerprints,
+		EmbeddingsEnabled:     newCfg.Features.EmbeddingsEnabled,
+		WatermarkStripEnabled: newCfg.Features.WatermarkStripEnabled,
+		RecordClientInfo:      newCfg.Logging.RequestClientInfo,
+		RecordContext:         newCfg.Logging.RequestArchiveContext,
+		HiddenModels:          livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 		// 白名单热生效：与 HiddenModels 同一条快照重建通路（issue #68）。
 		AllowedModels:    newAllowedModels,
 		AllowlistEnabled: newAllowlistEnabled,
@@ -893,8 +901,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring, newCfg.ExpiringSoonDur)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.SetKeepaliveRefreshWindow(newCfg.KeepaliveRefreshWindowDur)
-	p.SetReserveCredits(*newCfg.Pool.ReserveCredits)  // 保留积分热生效（0 = 关闭，缺省 10）
-	p.SetAccountPriority(newCfg.Pool.AccountPriority) // 账号优先级/占比热生效（issue #62）
+	p.SetReserveCredits(*newCfg.Pool.ReserveCredits)              // 保留积分热生效（0 = 关闭，缺省 10）
+	p.SetReserveCreditsByRealm(newCfg.Pool.ReserveCreditsByRealm) // 按域覆盖热生效（issue #147）
+	p.SetAccountPriority(newCfg.Pool.AccountPriority)             // 账号优先级/占比热生效（issue #62）
 	p.SetAccountShare(newCfg.Pool.AccountShare)
 	sch.Reconfigure(scheduler.ScheduleParams{
 		CheckinHours:   newCfg.Schedule.CheckinHours,

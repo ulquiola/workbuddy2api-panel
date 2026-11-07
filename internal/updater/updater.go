@@ -73,12 +73,13 @@ type Settings struct {
 
 // Status is safe to expose through the authenticated panel API.
 type Status struct {
-	CurrentVersion string `json:"current_version"`
-	LatestVersion  string `json:"latest_version"`
-	ReleaseURL     string `json:"release_url"`
-	ReleaseNotes   string `json:"release_notes"`
-	CheckedAt      string `json:"checked_at"`
-	LastError      string `json:"last_error"`
+	CurrentVersion  string `json:"current_version"`
+	CurrentKnown    bool   `json:"current_known"` // Whether the current version can be compared with Releases.
+	LatestVersion   string `json:"latest_version"`
+	ReleaseURL      string `json:"release_url"`
+	ReleaseNotes    string `json:"release_notes"`
+	CheckedAt       string `json:"checked_at"`
+	LastError       string `json:"last_error"`
 	// Note 非错误的检查提示（如仓库暂无 Release）：面板按提示展示，不显示成「更新失败」。
 	Note            string `json:"note,omitempty"`
 	UpdateAvailable bool   `json:"update_available"`
@@ -158,6 +159,7 @@ func New(version, repository, configPath string, settings Settings) *Manager {
 			AutoTime:       settings.AutoTime,
 		},
 	}
+	_, m.status.CurrentKnown = parseVersion(m.version)
 	m.status.CanInstall = m.canInstallLocked()
 	if executable != "" {
 		CleanupStaleTempFiles(filepath.Dir(executable), staleTempAge)
@@ -272,7 +274,8 @@ func (m *Manager) Check(ctx context.Context) error {
 			m.status.ReleaseURL = releaseURL
 			m.status.ReleaseNotes = newest.Body
 			current, currentOK := parseVersion(m.version)
-			m.status.UpdateAvailable = !currentOK || newestVersion.ordinal > current.ordinal
+			// An unknown build may be newer than the Release; do not advertise a downgrade.
+			m.status.UpdateAvailable = currentOK && newestVersion.ordinal > current.ordinal
 			m.status.CanInstall = m.canInstallLocked()
 			m.status.LastError = ""
 			m.status.Note = ""

@@ -27,6 +27,14 @@ func TestResolveGatewayEffort(t *testing.T) {
 		{"具体档支持则原样", "high", supported, "high"},
 		{"不支持时落到不高于它的最高档", "medium", supported, "low"},
 		{"低于最低支持档时取最低", "minimal", []string{"high", "max"}, "high"},
+		// off 不是可降级档位：glm / v4-pro 这类 [off, high, xhigh] 的列表在「要的档
+		// 比最低正档还低」时必须落到 high，而不是把思考静默关掉（修前是 off）。
+		{"列表含 off 时不得降级到 off", "medium", []string{"high", "xhigh", "off"}, "high"},
+		{"minimal 遇 off 列表仍取最低正档", "minimal", []string{"high", "xhigh", "off"}, "high"},
+		{"low 遇 off 列表仍取最低正档", "low", []string{"high", "off"}, "high"},
+		// 退化列表（只声明了 off）：没有任何可降级的正档，返回 "" = 不改写，与
+		// 「无法识别愿望档」同口径。绝不返回 off —— 那等于凭一个缺失的档位把思考关掉。
+		{"只有 off 时无从降级", "low", []string{"off"}, ""},
 		{"列表不含可识别档位时取最后一项", "max", []string{"weird-a", "weird-b"}, "weird-b"},
 		{"空支持列表", "max", nil, ""},
 		{"无法识别的愿望档", "turbo", supported, ""},
@@ -210,5 +218,24 @@ func TestEffortPolicyNormalized(t *testing.T) {
 	}
 	if len(p.ModelDefaults) != 1 || p.ModelDefaults["glm-5.2"] != "high" {
 		t.Fatalf("model defaults=%v", p.ModelDefaults)
+	}
+}
+
+// TestEffortPolicyEmptyDefaultIsHigh 空档位回落 high 而不是 max。
+//
+// 依据（2026-11-07 本机对照实测，cn:deepseek-v4.1-flash，同一 max_tokens=8192）：
+//
+//	max  → think 8192 / 正文≈1906 token；另一轮 think=7612 直接把额度吃光触发截断
+//	high → think 4068 / 正文≈3236 token（正文多 70%）
+//
+// 上游把思考与正文算在同一份输出额度里，max 并不是「更强的回答」，而是「更长的思考」。
+// hub（wb_proxy.default_reasoning_effort_mode）同样默认 high，并在注释里记着 issue #508。
+func TestEffortPolicyEmptyDefaultIsHigh(t *testing.T) {
+	if got := (EffortPolicy{}).Normalized().DefaultEffort; got != "high" {
+		t.Fatalf("空 default_effort 应回落 high，got %q", got)
+	}
+	// 显式配置仍然照单全收：要最深推理的人写 max 就该是 max。
+	if got := (EffortPolicy{DefaultEffort: "max"}).Normalized().DefaultEffort; got != "max" {
+		t.Fatalf("显式 max 不应被改写，got %q", got)
 	}
 }

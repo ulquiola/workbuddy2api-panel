@@ -30,6 +30,7 @@ if (s < 0 || e < 0) throw new Error('renderAccounts block not found');
 const stubs = {
   document: { activeElement: null },
   lastAccountsList: [], accRealmFilter: 'all',
+  accGroupFilter: '', lastVisibleAccounts: [], syncGroupFilter: () => {},
   esc: x => String(x == null ? '' : x),
   rateLimitRowsHtml: () => '',
   disabledKind: () => null, disabledAge: () => '',
@@ -107,8 +108,8 @@ process.stdout.write(JSON.stringify(out));`
 		if r.Cls != "" {
 			t.Errorf("健康池不该带 with-probe（第 %d 行: %q）", i+1, r.Cls)
 		}
-		if r.N != 6 {
-			t.Errorf("健康行槽位应为 6（签到/余额/任务/选号/禁用/移除），第 %d 行实际 %d", i+1, r.N)
+		if r.N != 7 {
+			t.Errorf("健康行槽位应为 7（签到/余额/任务/选号/禁用/备注/移除），第 %d 行实际 %d", i+1, r.N)
 		}
 		if r.Probe {
 			t.Errorf("健康账号不该出现探活按钮（第 %d 行）", i+1)
@@ -122,8 +123,8 @@ process.stdout.write(JSON.stringify(out));`
 		if r.Cls != "with-probe" {
 			t.Errorf("有冻结账号时整表都要带 with-probe（第 %d 行: %q）", i+1, r.Cls)
 		}
-		if r.N != 7 {
-			t.Errorf("含冻结账号时每行槽位应为 7，第 %d 行实际 %d（少一个会让 grid 折行、整列错位）", i+1, r.N)
+		if r.N != 8 {
+			t.Errorf("含冻结账号时每行槽位应为 8，第 %d 行实际 %d（少一个会让 grid 折行、整列错位）", i+1, r.N)
 		}
 	}
 	if got.Frozen[1].Probe == false {
@@ -137,7 +138,7 @@ process.stdout.write(JSON.stringify(out));`
 	}
 }
 
-// TestActsInnerGridTracks CSS 的轨道数必须和上面对得上：默认 6 列，with-probe 7 列。
+// TestActsInnerGridTracks CSS 的轨道数必须和上面对得上：默认 7 列，with-probe 8 列。
 func TestActsInnerGridTracks(t *testing.T) {
 	raw, err := os.ReadFile("index.html")
 	if err != nil {
@@ -148,15 +149,15 @@ func TestActsInnerGridTracks(t *testing.T) {
 	if base == nil {
 		t.Fatal(".acts-inner grid 规则不见了")
 	}
-	if base[1] != "repeat(3, 54px) 68px repeat(2, 54px)" {
-		t.Errorf("默认轨道应为 6 个槽（签到/余额/任务/选号 68px/禁用/移除），实际: %s", base[1])
+	if base[1] != "repeat(3, 54px) 68px repeat(3, 54px)" {
+		t.Errorf("默认轨道应为 7 个槽（签到/余额/任务/选号 68px/禁用/备注/移除），实际: %s", base[1])
 	}
 	with := regexp.MustCompile(`\.acts-inner\.with-probe \{ grid-template-columns: ([^;]+);`).
 		FindStringSubmatch(string(raw))
 	if with == nil {
 		t.Fatal(".acts-inner.with-probe 规则不见了 —— 有冻结账号时会缺一列")
 	}
-	if with[1] != "repeat(4, 54px) 68px repeat(2, 54px)" {
-		t.Errorf("with-probe 应为 7 个槽（多一个探活），实际: %s", with[1])
+	if with[1] != "repeat(4, 54px) 68px repeat(3, 54px)" {
+		t.Errorf("with-probe 应为 8 个槽（多一个探活），实际: %s", with[1])
 	}
 }
