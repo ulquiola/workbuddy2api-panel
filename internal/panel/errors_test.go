@@ -63,6 +63,36 @@ func TestAggregateErrorsCacheRecompute(t *testing.T) {
 	}
 }
 
+// 正文截断与上游断流各自成类：两者都是「回答没写完」，但原因与处置不同
+// （额度用尽 vs 上游链路断了），混进「其他（未归类）」就分不出来。
+func TestAggregateErrorsTruncationKinds(t *testing.T) {
+	got := AggregateErrors([]LogLine{
+		{
+			Text: `WARN: [server] stream acct=示例号(11f49997) model=deepseek-v4.1-flash: finish_reason=length 正文截断（tok=8192 think=7612 hasTok=true hasThink=true 客户端限额=true）——输出额度用尽，上游在此处切断`,
+			TS:   time.Now(),
+		},
+		{
+			Text: `WARN: [server] stream 上游未给终态就结束（无 finish_reason、无 data: [DONE]，12394 个有效帧）→ 按截断收尾`,
+			TS:   time.Now(),
+		},
+	})
+	byKey := map[string]ErrStat{}
+	for _, r := range got {
+		byKey[r.Kind] = r
+	}
+	if r, ok := byKey["正文截断（finish=length）"]; !ok || r.Sev != sevWarn {
+		t.Fatalf("正文截断应单独成类：%+v", got)
+	}
+	if r, ok := byKey["上游断流（已补截断终态）"]; !ok || r.Sev != sevWarn {
+		t.Fatalf("上游断流应单独成类：%+v", got)
+	}
+	for _, r := range got {
+		if strings.Contains(r.Kind, "未归类") {
+			t.Fatalf("不应落进未归类桶：%+v", r)
+		}
+	}
+}
+
 // 没匹配到规则的 WARN/ERR 归「其他（未归类）」，绝不静默丢弃：新增日志文案时要当场看见，
 // 否则汇总看着正常、错的只是它少了一行（最难发现的漏报）。
 func TestAggregateErrorsUnclassifiedNotDropped(t *testing.T) {
@@ -227,5 +257,25 @@ func TestAggregateErrorsSampleIsRuneSafe(t *testing.T) {
 		if r == '\uFFFD' {
 			t.Fatalf("全文样本出现非法 UTF-8（第 %d 字节）：%q", i, got[0].SampleFull)
 		}
+	}
+}
+
+// 续写救援要能在面板里数出来：`[narration]` / `[toolonly]` 是「模型自己收尾」时
+// 网关补了一次续写的痕迹，属于 info（链路成功、客户端内容正常），不能混进「其他」，
+// 否则永远说不清到底救了多少、还剩多少没救。
+func TestAggregateErrorsRescueKinds(t *testing.T) {
+	got := AggregateErrors([]LogLine{
+		{Text: `2026/11/10 20:31:27 [toolonly] acct=示例号(11f49997) model=deepseek-v4.1-flash seg=1 正文只有 1400B 就收尾（末条是工具结果）→ 试续一次，只采纳工具调用`, TS: time.Now()},
+		{Text: `2026/11/10 20:31:28 [toolonly] acct=示例号(11f49997) model=deepseek-v4.1-flash seg=1 续写段拿到工具调用 → 采纳`, TS: time.Now()},
+		{Text: `2026/11/10 20:31:29 [narration] acct=示例号(11f49997) model=deepseek-v4.1-flash 结果：共 2 段，工具调用=true，正文合计=343B`, TS: time.Now()},
+	})
+	if len(got) != 1 {
+		t.Fatalf("三类救援行应归成一个统计项，实际 %d 项：%+v", len(got), got)
+	}
+	if got[0].Kind != "续写救援（说一句就停）" || got[0].Sev != sevInfo {
+		t.Fatalf("救援行应归类为 info 的「续写救援」：%+v", got[0])
+	}
+	if got[0].Count != 3 {
+		t.Fatalf("救援计数应为 3，实际 %d", got[0].Count)
 	}
 }

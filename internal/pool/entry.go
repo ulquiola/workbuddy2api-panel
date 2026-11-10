@@ -73,12 +73,15 @@ type ExpiryBucket struct {
 	Date     string    `json:"date"`
 	ExpireAt time.Time `json:"expires_at,omitempty"`
 	Remain   int64     `json:"remain"`
+	// Estimated 该日至少有一批的到期日按计量周期推算（非上游真实扣费截止），
+	// 面板据此标注「按计量周期推算」（issue #200）。
+	Estimated bool `json:"estimated,omitempty"`
 }
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID          string `json:"uid"`
-	Nickname     string `json:"nickname,omitempty"`
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
 	// Alias 本地备注名（面板可编辑，仅本地面板使用；与上游 nickname 独立，
 	// 昵称同步不会覆盖）。空 = 未设置，前端回落到 nickname/uid。
 	Alias        string `json:"alias,omitempty"`
@@ -555,19 +558,19 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits          int64     `json:"credits"`
-	CreditsRemainder float64   `json:"credits_remainder,omitempty"`
-	CreditsTotal     int64     `json:"credits_total,omitempty"`
-	Disabled         bool      `json:"disabled"`
-	Paused           bool      `json:"paused,omitempty"`
-	Group            string    `json:"group,omitempty"`
-	Reason           string    `json:"reason,omitempty"`
+	Credits          int64   `json:"credits"`
+	CreditsRemainder float64 `json:"credits_remainder,omitempty"`
+	CreditsTotal     int64   `json:"credits_total,omitempty"`
+	Disabled         bool    `json:"disabled"`
+	Paused           bool    `json:"paused,omitempty"`
+	Group            string  `json:"group,omitempty"`
+	Reason           string  `json:"reason,omitempty"`
 	// Alias 本地备注名（面板就地编辑；与上游 nickname 独立，昵称同步不覆盖）。
-	Alias            string    `json:"alias,omitempty"`
-	DisabledAt       time.Time `json:"disabled_at,omitempty"` // 禁用时刻（持久化：重启后仍能看出禁了多久）
-	Until            time.Time `json:"until,omitempty"`
-	CoolKind         CoolKind  `json:"cool_kind"`
-	SuccessCount     int64     `json:"success_count,omitempty"`
+	Alias        string    `json:"alias,omitempty"`
+	DisabledAt   time.Time `json:"disabled_at,omitempty"` // 禁用时刻（持久化：重启后仍能看出禁了多久）
+	Until        time.Time `json:"until,omitempty"`
+	CoolKind     CoolKind  `json:"cool_kind"`
+	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
 	ErrTotal    int64     `json:"err_total,omitempty"`
@@ -652,6 +655,10 @@ type stateModelCost struct {
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]stateAccount `json:"accounts"`
+	// Windows 额度窗口登记表（window.go）。放在顶层而不是每个 stateAccount 里：
+	// 它是排程语义（到点发探针），不是账号路由状态，跟着账号走会让「删号重加」
+	// 顺手把窗口也删掉——而额度窗口是上游侧的客观事实，与本地账号记录无关。
+	Windows map[string]stateModelWindow `json:"model_windows,omitempty"`
 }
 
 // flushInterval 后台落盘周期。

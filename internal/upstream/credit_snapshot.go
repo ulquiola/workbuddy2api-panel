@@ -54,6 +54,8 @@ type creditGrant struct {
 	Used           int64
 	Size           int64
 	Cycle          bool
+	// Estimated 到期日只能按计量周期（CycleEndTime）推算，不是上游真实扣费截止。
+	Estimated bool
 }
 
 // creditAccountRow 是 CN get-user-resource 与 global paid/free 明细的共同字段形态。
@@ -147,6 +149,7 @@ func (c *Client) globalCreditSnapshot(a *auth.Auth, soon time.Duration) (CreditS
 	now := time.Now()
 	var remain, total int64
 	codes := make([]string, 0, len(sum.Packages))
+	remainByCode := make(map[string]int64, len(sum.Packages))
 	for _, p := range sum.Packages {
 		r := int64(p.CycleRemainCapacity)
 		s := int64(p.CycleTotalCapacity)
@@ -160,11 +163,42 @@ func (c *Client) globalCreditSnapshot(a *auth.Auth, soon time.Duration) (CreditS
 		total += s
 		if p.PackageCode != "" {
 			codes = append(codes, p.PackageCode)
+			remainByCode[p.PackageCode] = r
 		}
 	}
 
 	rows, detailOK := c.globalPackageDetails(a, codes)
-	snap := buildCreditSnapshot(remain, total, mergeGlobalGrants(rows), soon, now)
+	grants := mergeGlobalGrants(rows)
+	// 每个码有多少个未来周期：只有一个时，「借用 summary 余额」不会跨周期串味，
+	// 保留给「明细自报 0 而 summary 有数」的套餐型包（历史行为）；多个时一律不借，
+	// 否则又回到把新周期余额摊到所有周期上的老问题（issue #200）。
+	futurePerCode := make(map[string]int, len(grants))
+	estimated := 0
+	for _, g := range grants {
+		if !g.HasEnd || !g.End.After(now) {
+			continue
+		}
+		futurePerCode[g.PackageCode]++
+		if g.Estimated {
+			estimated++
+		}
+	}
+	for i := range grants {
+		g := &grants[i]
+		if !g.HasEnd || !g.End.After(now) || g.Remain > 0 {
+			continue
+		}
+		if futurePerCode[g.PackageCode] == 1 {
+			if sr, ok := remainByCode[g.PackageCode]; ok {
+				g.Remain = sr
+			}
+		}
+	}
+	if estimated > 0 {
+		log.Printf("WARN: [billing] %d 个积分类的到期日只能按计量周期（CycleEndTime）推算（acct=%s）",
+			estimated, logfmt.Label(a.UID, a.Nickname))
+	}
+	snap := buildCreditSnapshot(remain, total, grants, soon, now)
 	if detailOK == 0 && len(codes) > 0 {
 		snap.packagesErr = fmt.Errorf("套餐明细拉取失败")
 	}
@@ -239,16 +273,20 @@ func creditGrantFromRow(r creditAccountRow) creditGrant {
 	if size < remain {
 		size = remain
 	}
-	end, hasEnd := packageEndAt(r.DeductionEndTime, r.ExpiredTime, r.CycleEndTime)
+	end, estimated, hasEnd := packageEndAtEx(r.DeductionEndTime, r.ExpiredTime, r.CycleEndTime)
 	created := time.Time{}
 	if r.CreateTime > 0 {
 		created = time.UnixMilli(r.CreateTime)
 	}
 	rid := strings.TrimSpace(r.ResourceID)
 	if rid == "" {
-		// 上游没给 ResourceId 时用「包码 + 扣费截止 + 发放时刻」兜底：同一包的
-		// 多个计量周期通常共享这三者，不同日包至少发放时刻不同。
-		rid = fmt.Sprintf("%s|%d|%d", r.PackageCode, r.DeductionEndTime, r.CreateTime)
+		// 上游没给 ResourceId 时用「包码 + 解析后的到期时刻」兜底：日赠包同码不同 end，
+		// 只有 end 才能把它们分开；同一批在 paid/free 两条端点重复下发时 end 相同。
+		if hasEnd {
+			rid = fmt.Sprintf("%s|%d", r.PackageCode, end.Unix())
+		} else {
+			rid = fmt.Sprintf("%s|%d", r.PackageCode, r.CreateTime)
+		}
 	}
 	return creditGrant{
 		ResourceID:     rid,
@@ -263,65 +301,42 @@ func creditGrantFromRow(r creditAccountRow) creditGrant {
 		Used:           used,
 		Size:           size,
 		Cycle:          r.CycleCapacitySize > 0,
+		Estimated:      estimated,
 	}
 }
 
-// mergeGlobalGrants 按 ResourceId 归并 global 明细。
+// mergeGlobalGrants 按 (ResourceId, 到期时刻) 归并 global 明细。
 //
-// 同一 ResourceId 的多个计量周期只保留一条：优先最早到期且仍有余额的周期（FEFO
-// 真正会先扣完的那期），其次最早到期的周期，全部过期则保留最新一条供构成展示。
-// 不同 ResourceId 即使 PackageCode 相同也各自保留——日赠包正是这种形态。
+// 归并单位是「包的**一个计量周期**」，不是 PackageCode：国际版 Bonus Pack 每天发一个
+// 包、所有包共用同一个 PackageCode（issue #200 线上取证：32 行同码、各自 CycleEndTime
+// 逐日递推），按码归并会把 30 个日包合成一批。同一 (ResourceId, end) 可能同时出现在
+// paid / free 两条端点（重复下发），留剩余更大的那条；同一 ResourceId 的不同 end 是
+// 不同周期，各自保留。
 func mergeGlobalGrants(rows []creditAccountRow) []creditGrant {
-	now := time.Now()
-	groups := make(map[string][]creditGrant, len(rows))
 	order := make([]string, 0, len(rows))
+	best := make(map[string]creditGrant, len(rows))
 	for _, row := range rows {
 		g := creditGrantFromRow(row)
-		if _, seen := groups[g.ResourceID]; !seen {
-			order = append(order, g.ResourceID)
+		key := g.ResourceID
+		if g.HasEnd {
+			key += "|" + fmt.Sprintf("%d", g.End.Unix())
+		} else {
+			key += "|none"
 		}
-		groups[g.ResourceID] = append(groups[g.ResourceID], g)
-	}
-	out := make([]creditGrant, 0, len(groups))
-	for _, key := range order {
-		out = append(out, pickGlobalGrant(groups[key], now))
-	}
-	return out
-}
-
-func pickGlobalGrant(grants []creditGrant, now time.Time) creditGrant {
-	sort.SliceStable(grants, func(i, j int) bool {
-		if grants[i].HasEnd != grants[j].HasEnd {
-			return grants[i].HasEnd
-		}
-		return grants[i].End.Before(grants[j].End)
-	})
-	var firstFuture, firstFuturePositive *creditGrant
-	for i := range grants {
-		g := &grants[i]
-		if !g.HasEnd || !g.End.After(now) {
+		if cur, seen := best[key]; seen {
+			if g.Remain > cur.Remain {
+				best[key] = g
+			}
 			continue
 		}
-		if firstFuture == nil {
-			firstFuture = g
-		}
-		if g.Remain > 0 {
-			firstFuturePositive = g
-			break
-		}
+		order = append(order, key)
+		best[key] = g
 	}
-	if firstFuturePositive != nil {
-		return *firstFuturePositive
+	out := make([]creditGrant, 0, len(order))
+	for _, key := range order {
+		out = append(out, best[key])
 	}
-	if firstFuture != nil {
-		return *firstFuture
-	}
-	for _, g := range grants {
-		if !g.HasEnd && g.Remain > 0 {
-			return g
-		}
-	}
-	return grants[len(grants)-1]
+	return out
 }
 
 // buildCreditSnapshot 由同一批 grants 产出 totals/buckets/packages。
@@ -343,6 +358,11 @@ func buildCreditSnapshot(remain, total int64, grants []creditGrant, soon time.Du
 			byDate[day] = b
 		} else if g.End.Before(b.ExpireAt) {
 			b.ExpireAt = g.End
+		}
+		if g.Estimated {
+			// 同日多批里只要有一批是推算的，整行就标注——面板一行只展示「该日」，
+			// 混了两种口径时保守地显示为推算。
+			b.Estimated = true
 		}
 		b.Remain += g.Remain
 		if soon > 0 && !g.End.After(now.Add(soon)) {

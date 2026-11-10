@@ -2057,11 +2057,12 @@ func TestAppJSAllCalledFunctionsDefined(t *testing.T) {
 	js := string(src)
 
 	// 去掉注释与字符串字面量，避免把注释里的 `foo(` 或字符串里的 `'a(b'` 当调用。
-	// 顺序敏感：先块注释、再行注释、最后字符串（与真实词法顺序一致）。
-	js = regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(js, "")
-	js = regexp.MustCompile(`//[^\n]*`).ReplaceAllString(js, "")
-	js = regexp.MustCompile(`(?s)'[^'\\\n]*(?:\\.[^'\\\n]*)*'`).ReplaceAllString(js, "''")
-	js = regexp.MustCompile("(?s)`[^`]*`").ReplaceAllString(js, "``")
+	//
+	// 必须是**单遍扫描**，不能用「先删注释、再删字符串」的正则序列：那样字符串里的
+	// `://`（例如一句「支持 http:// 与 socks5://」的提示文案）会被当成行注释起点，
+	// 一路吃到行尾把后面的字符串开头引号也吞掉，此后整份源码的词法全错位——
+	// 表现是一堆毫不相关的用例同时报「某函数未定义」。这里按真实词法顺序走一遍。
+	js = stripJSCommentsAndStrings(js)
 
 	// JS 关键字 / 运算符形态，不是函数调用。
 	keywords := map[string]bool{
@@ -2355,5 +2356,130 @@ process.exit(0);
 	}
 	if !bytes.Contains(out, []byte("OK")) {
 		t.Fatalf("余额趋势控件接线测试未通过:\n%s", out)
+	}
+}
+
+// stripJSCommentsAndStrings 单遍去掉 JS 注释与字符串字面量（保留换行，其余字符
+// 用空格占位，避免把相邻标识符粘成一个）。
+//
+// 为什么不能用正则序列：字符串里的 `://` 会被「删行注释」那条规则当成注释起点，
+// 吃掉行尾——连后面的引号一起没了，之后整份源码的引号配对全部错位，一堆无关用例
+// 同时报「函数未定义」。这里按真实词法顺序扫：见到引号就进字符串态、见到 `/` 才判
+// 注释，两者互不吃掉对方。
+func stripJSCommentsAndStrings(src string) string {
+	var b strings.Builder
+	b.Grow(len(src))
+	n := len(src)
+	for i := 0; i < n; {
+		c := src[i]
+		switch {
+		case c == '/' && i+1 < n && src[i+1] == '/':
+			for i < n && src[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < n && src[i+1] == '*':
+			i += 2
+			for i+1 < n && !(src[i] == '*' && src[i+1] == '/') {
+				if src[i] == '\n' {
+					b.WriteByte('\n')
+				}
+				i++
+			}
+			i += 2
+		case c == '\'' || c == '"' || c == '`':
+			quote := c
+			i++
+			for i < n {
+				if src[i] == '\\' && quote != '`' {
+					i += 2
+					continue
+				}
+				if src[i] == quote {
+					i++
+					break
+				}
+				// 普通引号不允许跨行：遇到换行就认为字符串被截断，回退成代码继续扫，
+				// 免得一个坏引号把后面整份文件都吞成字符串。
+				if quote != '`' && src[i] == '\n' {
+					b.WriteByte('\n')
+					i++
+					break
+				}
+				if src[i] == '\n' {
+					b.WriteByte('\n')
+				}
+				i++
+			}
+			b.WriteByte(' ')
+		case c == '\n':
+			b.WriteByte('\n')
+			i++
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	return b.String()
+}
+
+// TestAppJSExpiryEstimatedBadge 到期日只能按计量周期推算时（issue #200 的 estimated
+// 标记），摘要和账号行都要显示「按计量周期推算」，不能让运维把推算值当权威日期。
+func TestAppJSExpiryEstimatedBadge(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry estimated test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expCSTDate');
+const end = src.indexOf('// 收纳行展开/收起');
+if (start < 0 || end < 0) throw new Error('expiry helpers not found');
+const ctx = { acctName: a => String(a.nickname || a.uid), aliasForUid: () => '',
+  Number, String, Array, Date, Math, JSON, PK_DAY_MS: 86400000,
+  expHero: { innerHTML: '' }, expKpis: { innerHTML: '' },
+  expBody: { innerHTML: '', querySelector: () => null }, expNote: { textContent: '' },
+  esc: s => String(s), fmtTok: n => String(n),
+};
+ctx.$ = id => ctx[id];
+vm.createContext(ctx);
+vm.runInContext("'use strict';\n" + 'const restOpen = Object.create(null);\n' +
+  src.slice(start, end) + '\nthis.renderExpirySnapshot=renderExpirySnapshot;', ctx);
+const day = n => {
+  const d = new Date(Date.now() + n * 86400000);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(d);
+  const p = t => (parts.find(x => x.type === t) || {}).value;
+  return p('year') + '-' + p('month') + '-' + p('day');
+};
+ctx.renderExpirySnapshot({ accounts: [
+  { uid: 'est', nickname: 'estimated-account', credits_expiry_buckets: [
+    { date: day(1), remain: 30, estimated: true }] },
+  { uid: 'ok', nickname: 'exact-account', credits_expiry_buckets: [
+    { date: day(5), remain: 50 }] },
+]});
+const all = ctx.expHero.innerHTML + ctx.expBody.innerHTML;
+process.stdout.write(JSON.stringify({
+  hero: ctx.expHero.innerHTML.includes('按计量周期推算'),
+  row: ctx.expBody.innerHTML.includes('按计量周期推算'),
+  count: (all.match(/按计量周期推算/g) || []).length,
+  exactClean: !ctx.expBody.innerHTML.split('<div class="exp-row"')[2].includes('按计量周期推算'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "expiry-est-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry estimated node test failed: %v\n%s", err, out)
+	}
+	const want = `{"hero":true,"row":true,"count":2,"exactClean":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("到期估算标记不符:\n got=%s\nwant=%s", strings.TrimSpace(string(out)), want)
 	}
 }

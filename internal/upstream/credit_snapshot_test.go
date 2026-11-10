@@ -88,15 +88,15 @@ func TestGlobalSnapshotKeepsSameCodeDailyGrants(t *testing.T) {
 	}
 }
 
-// 同一 ResourceId 的多个计量周期只取最早未来且仍有余额的一期，
-// 不把同一笔余额重复计入批次。
-func TestGlobalSnapshotDedupesResourceCycles(t *testing.T) {
+// 同一 (ResourceId, end) 在 paid/free 两条端点重复下发时只留剩余更大的一条，
+// 不把同一笔余额重复计入批次（issue #200 的「同周期去重」侧）。
+func TestGlobalSnapshotDedupesSameCycleAcrossEndpoints(t *testing.T) {
 	now := time.Now().In(softRateResetLoc)
 	ms := func(t time.Time) int64 { return t.UnixMilli() }
-	row := func(end time.Time, remain int) string {
+	row := func(remain int) string {
 		return fmt.Sprintf(`{"PackageCode":"PKG-C","PackageName":"Subscription","ResourceId":"same",`+
-			`"DeductionEndTime":%d,"CycleCapacitySize":100,"CycleCapacityRemain":%d,"CycleCapacityUsed":0}`,
-			ms(end), remain)
+			`"DeductionEndTime":%d,"CycleCapacitySize":40,"CycleCapacityRemain":%d,"CycleCapacityUsed":0}`,
+			ms(now.Add(2*24*time.Hour)), remain)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -104,8 +104,49 @@ func TestGlobalSnapshotDedupesResourceCycles(t *testing.T) {
 			fmt.Fprint(w, `{"code":0,"data":{"Packages":[`+
 				`{"PackageCode":"PKG-C","CycleTotalCapacity":"40","CycleRemainCapacity":"40"}]}}`)
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource-free-packages"):
-			fmt.Fprintf(w, `{"code":0,"data":{"Accounts":[%s,%s],"TotalCount":2}}`,
-				row(now.Add(2*24*time.Hour), 40), row(now.Add(10*24*time.Hour), 60))
+			fmt.Fprintf(w, `{"code":0,"data":{"Accounts":[%s],"TotalCount":1}}`, row(40))
+		case strings.HasSuffix(r.URL.Path, "/get-user-resource-paid-packages"):
+			fmt.Fprintf(w, `{"code":0,"data":{"Accounts":[%s],"TotalCount":1}}`, row(25))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), BillingBaseGlobal: srv.URL, GlobalEnabled: true}
+	_, _, _, _, earliestRemaining, buckets, err := c.UserResourceSnapshot(globalAuth(), 0)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(buckets) != 1 || buckets[0].Remain != 40 || earliestRemaining != 40 {
+		t.Fatalf("buckets=%+v earliest=%d want 单批 40（同周期重复只留更大）", buckets, earliestRemaining)
+	}
+	packs, _, _, err := c.CreditPackages(globalAuth())
+	if err != nil {
+		t.Fatalf("packages: %v", err)
+	}
+	if len(packs) != 1 || packs[0].Remain != 40 {
+		t.Fatalf("packages=%+v want 单包 40", packs)
+	}
+}
+
+// 同一 ResourceId 的不同 end 是不同计量周期，各自保留（issue #200 的「多周期不再
+// 合并成一批」侧）；summary 余额不跨周期借用。
+func TestGlobalSnapshotKeepsResourceCyclesSeparate(t *testing.T) {
+	now := time.Now().In(softRateResetLoc)
+	ms := func(t time.Time) int64 { return t.UnixMilli() }
+	row := func(days, remain int) string {
+		return fmt.Sprintf(`{"PackageCode":"PKG-C","PackageName":"Subscription","ResourceId":"same",`+
+			`"DeductionEndTime":%d,"CycleCapacitySize":100,"CycleCapacityRemain":%d,"CycleCapacityUsed":0}`,
+			ms(now.Add(time.Duration(days)*24*time.Hour)), remain)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/get-user-resource-summary"):
+			fmt.Fprint(w, `{"code":0,"data":{"Packages":[`+
+				`{"PackageCode":"PKG-C","CycleTotalCapacity":"100","CycleRemainCapacity":"100"}]}}`)
+		case strings.HasSuffix(r.URL.Path, "/get-user-resource-free-packages"):
+			fmt.Fprintf(w, `{"code":0,"data":{"Accounts":[%s,%s],"TotalCount":2}}`, row(2, 40), row(10, 60))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource-paid-packages"):
 			fmt.Fprint(w, `{"code":0,"data":{"Accounts":[],"TotalCount":0}}`)
 		default:
@@ -119,15 +160,15 @@ func TestGlobalSnapshotDedupesResourceCycles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
-	if len(buckets) != 1 || buckets[0].Remain != 40 || earliestRemaining != 40 {
-		t.Fatalf("buckets=%+v earliest=%d want 单批 40", buckets, earliestRemaining)
+	if len(buckets) != 2 || buckets[0].Remain != 40 || buckets[1].Remain != 60 || earliestRemaining != 40 {
+		t.Fatalf("buckets=%+v earliest=%d want 两批 40/60", buckets, earliestRemaining)
 	}
 	packs, _, _, err := c.CreditPackages(globalAuth())
 	if err != nil {
 		t.Fatalf("packages: %v", err)
 	}
-	if len(packs) != 1 || packs[0].Remain != 40 {
-		t.Fatalf("packages=%+v want 单包 40", packs)
+	if len(packs) != 2 {
+		t.Fatalf("packages=%+v want 两个周期", packs)
 	}
 }
 

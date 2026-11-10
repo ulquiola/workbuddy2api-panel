@@ -1112,18 +1112,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// session.ExtractKey 的 anti-monopoly 闸）时用内容派生键——否则这些客户端的
 	// prompt_cache_key 退化成每账号一个常量槽，同账号上多段对话互相覆盖前缀缓存
 	// （issue #5：glm-5.3 大上下文周期性命中率掉到 0.2%）。
-	// 只供缓存槽使用：账号绑定仍只认 sessKey，不复活 user 维度粘性。
 	cacheKeyID := sessKey
 	if cacheKeyID == "" {
 		cacheKeyID = session.DeriveCacheKey(body)
 	}
+	// 账号粘性也认这个派生键：上游前缀缓存按账号隔离（cache_key 里掺 uid），
+	// 账号一换就是全量 miss。只发 user_id 的客户端（ExtractKey 的 anti-monopoly
+	// 闸返回空）此前每轮都被轮换到新号——实测同一份 3.6k body 连发两次，落两个
+	// 不同账号、miss 3634/3634；带 conversation_id 或什么都不带时第二轮命中
+	// 3456/3634（95%）。派生键是 system+首条 user 的内容哈希，天然是**对话级**
+	// 而非用户级：同一用户的并行对话首条 user 不同 → 键不同 → 照旧分散，原契约
+	// 想避免的「一个 user 全钉在同一号」不会发生；相对的是每条 8k 前缀从 0.02
+	// credit 涨到 0.34（cache_key.go 实测，17×）。
+	bindKey := sessKey
+	if bindKey == "" {
+		bindKey = cacheKeyID
+	}
 	stickyUID := ""
-	if h.cfg.Session != nil && sessKey != "" {
+	if h.cfg.Session != nil && bindKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
 		// 用 routeModel 而非 peek.Model（issue #30）：映射后必须按真实模型的
 		// 可用性口径判绑定，别名名不在任何账本里。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, routeModel); ok {
+		if uid, ok := h.cfg.Session.ResolveForModel(bindKey, routeModel); ok {
 			stickyUID = uid
 		}
 	}
@@ -1157,7 +1168,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 	unbindSticky := func() {
 		if stickyUID != "" {
-			h.cfg.Session.Unbind(sessKey)
+			h.cfg.Session.Unbind(bindKey)
 			stickyUID = ""
 		}
 	}
@@ -1479,10 +1490,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				fail(acct.UID)
 				break
 			}
-			h.cfg.Pool.NoteFailures(acct.UID)
+			// 出口级归因（egress.go）：走到这里的传输层失败**只可能**是直连路径
+			// （经代理的失败是 proxypool.Error，上面已终止轮转），而直连出口由本域
+			// 全部账号共用。拨号/TLS 失败发生在上游看到这个号之前，不携带「这个号
+			// 坏了」的任何证据；记到账号头上时，一次链路抖动会顺着轮转逐个给被选中
+			// 的号记连败——hub 现场实测 4 小时 196 次 URLError 陆续降权 13 个号，
+			// 而链路只断了几秒。改记出口，退避降到秒级。
+			streak := h.cfg.Pool.NoteEgressFailure(egressKey(acct), time.Now())
 			fail(acct.UID)
-			if !rotateBackoff(i, r.Context()) {
-				break // ctx 取消：终止轮转（传输层错误换号退避）
+			if streak >= egressGiveUpStreak {
+				// 链路连续失败：换号只是把同样的等待与失败重复一遍（换不到别的
+				// 链路），快速失败让客户端按自己的节奏重试。
+				break
+			}
+			if !sleepCtx(r.Context(), egressBackoff(streak, egressBackoffBase)) {
+				break // ctx 取消：终止轮转（传输层错误换路退避）
 			}
 			continue
 		}
@@ -1671,17 +1693,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 请求级参数拒绝（11101 请求体解析失败 / 11133 模型供应商拒绝参数）：与
-			// 11115 / 图片无效同一哲学——同一 body 换任何账号都是同样的拒绝，轮转只会
+			// 请求级参数拒绝（11101 请求体解析失败 / 11133 模型供应商拒绝参数 / 11151 空 text 段）：
+			// 与 11115 / 图片无效同一哲学——同一 body 换任何账号都是同样的拒绝，轮转只会
 			// 放大无效请求（每号一次上游调用 + rotateBackoff 占用在途名额）。更要紧的
 			// 是：继续轮转后末端会落到「其余保持 503」，把确定失败的请求伪装成
 			// "账号不可用、稍后再试"，客户端于是对必然失败的请求无限重试。立即透传
 			// 上游原文回 400。（11101 吸收上游 fd5c5a6；11133 见 payload.go 实测
-			// 「全号轮转同样被拒」）
-			if kind == upstream.ErrBadParams || kind == upstream.ErrModelParamInvalid {
+			// 「全号轮转同样被拒」；11151 的空段本该在出站前就补掉，走到这里是兜底）
+			if kind == upstream.ErrBadParams || kind == upstream.ErrModelParamInvalid || kind == upstream.ErrEmptyContent {
 				code, fallback := "bad_params", "chat request body was rejected by upstream"
-				if kind == upstream.ErrModelParamInvalid {
+				switch kind {
+				case upstream.ErrModelParamInvalid:
 					code, fallback = "model_param_invalid", "request parameters were rejected by the upstream model provider"
+				case upstream.ErrEmptyContent:
+					code, fallback = "empty_content", "a message in the request history has empty content"
 				}
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
@@ -1726,8 +1751,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.BlockModelClear(acct.UID, curModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+		if bindKey != "" && h.cfg.Session != nil {
+			h.cfg.Session.Bind(bindKey, acct.UID)
 		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
@@ -1735,7 +1760,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 截断自动续写（见 continue.go）：上游 finish_reason=length 且为纯文本/推理
 			// 段时，同账号同模型补发「已输出内容+续写指令」，多段拼成一条客户端可见流。
 			// 显式限额 / 工具参数截断 / 续写请求失败 → 自动降级为今天的截断终态。
-			cont := newContinueReader(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc)
+			// 本轮生效档位对应的输出预算下限：续写/救援段从原始 body 重建，靠它把
+			// max_tokens 补回可用值（见 upstream.MinOutputBudget 的说明）。
+			cont := newContinueReaderWithFloor(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc,
+				upstream.MinOutputBudget(hopTiming.Effort))
 			defer cont.Close()
 			stats := newChatStatsReaderSince(cont, st.start)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
@@ -1748,7 +1776,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			repair := upstream.NewMarkupRepair(declaredTools, true)
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}), upstream.WithMarkupRepair(repair), upstream.WithModelEcho(modelEcho))
+			}), upstream.WithMarkupRepair(repair), upstream.WithModelEcho(modelEcho),
+				// 客户端已断开时上游只是被动跟随，别把断流记成上游故障（日志归因）。
+				upstream.WithClientGoneFn(func() bool { return r.Context().Err() != nil }))
 			// 首帧否决（见 upstream.HeadVetoError）：网关一个字节都没写出，这次尝试对
 			// 客户端完全无痕——按错误类型处置账号后换号，而不是把「HTTP 200 + error 帧」
 			// 透给客户端（SSE 发过字节就改不了状态码，此前只能这么兜底）。
@@ -1896,7 +1926,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 空截断救援（见 starved.go）：额度被思考吃光、正文零字节。非流式这一侧
 		// 没有 continueReader，救援在这里做——同预算关思考重发一次、重新聚合。
 		if aggregateStarved(resp) && bodyHasOutputLimit(body) {
-			if rb, ok := starvedRetryBody(body); ok {
+			if rb, ok := starvedRetryBodyWithFloor(body, upstream.MinOutputBudget(hopTiming.Effort)); ok {
 				if rc2, st2, _, e2 := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, rb, clientIP, chatMeta, nil); e2 == nil && st2 < 400 && rc2 != nil {
 					if resp2, e3 := upstream.Aggregate(rc2); e3 == nil {
 						rc2.Close()
@@ -2351,6 +2381,20 @@ func rotateBackoff(i int, ctx context.Context) bool {
 	return true
 }
 
+// egressKey 这次传输层失败该记到哪个出口上。
+//
+// 键 = "direct:" + 域：cn 与 global 是不同的上游域名与网络环境，共用一条阶梯会让
+// 一个域的抖动压住另一个域刚恢复的那几秒。经代理的失败走不到这里（proxypool.Error
+// 在上游分支已终止轮转），所以不需要节点身份；真要按节点分级，应取
+// proxypool.Error.ProxyID，而不是在账号上猜。
+func egressKey(a *auth.Auth) string {
+	realm := "cn"
+	if a != nil && a.Realm() != "" {
+		realm = a.Realm()
+	}
+	return "direct:" + realm
+}
+
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
 // kind 是唯一权威分类（来自 upstream.Classify / ChatStreamContext 的 *Error 信封），
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
@@ -2412,6 +2456,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			modelReason = s
 		}
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
+			// 额度窗口登记（pool/window.go）：上游按**首次请求**起算新一轮配额窗口，
+			// 到点没有请求进来窗口就不开始——额度一直空转，下一条真实请求来的时候
+			// 起点才被动落到那一刻。冷却只做到「允许请求进来」，不做「让窗口开始」。
+			// 登记后由 scheduler 的窗口探针在重置时刻发一个最小请求把起点钉住。
+			//
+			// 只在 model != "" 时登记：没有模型名（账号级 429）时窗口键无从构造，而
+			// 账号级冷却的语义本来就与配额窗口无关。
+			if modelRateLimited && model != "" {
+				h.cfg.Pool.ScheduleModelWindow(uid, model, resetAt, !upstream.IsModelBusy(body), time.Now())
+			}
 			if modelRateLimited {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, modelReason)
 				return
@@ -2555,6 +2609,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// ErrSoftRate 罚号，会与全冷却兜底互相喂成整池停摆（2026-10-15 实案）。
 		// chatCompletions 轮转耗尽后走末端 ErrUpstreamBusy 分支回 429 + Retry-After，
 		// 不罚号原则在此保持不变。
+	case upstream.ErrEmptyContent:
+		// 11151 空 text 段：请求内容的问题（历史里某个 text 段是空串/缺失），同一 body
+		// 换任何账号都是同样的拒绝。零动作（不冷却/不熔断/不 NoteError/不喂连败，同
+		// ErrToolMismatch 待遇）；出站前 empty_text_part.go 已补位，走到这里说明补位
+		// 没覆盖该端点，chatCompletions 已 fail-fast 400 透传原文、终止轮转。
 	case upstream.ErrToolMismatch:
 		// 11148 工具配对断裂：请求内容的问题（会话历史里的 tool_calls / tool 结果对不上），
 		// 同一 body 换任何账号都是同样的拒绝。零动作（不冷却/不熔断/不 NoteError/不喂
