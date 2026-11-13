@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 禁收录（与 setSecurityHeaders 的 X-Robots-Tag 同一条意图）：响应头挡抓取，
+     这条挡的是被缓存/另存后的页面快照。 -->
+<meta name="robots" content="noindex, nofollow">
 <title>WorkBuddy2API · 控制台</title>
 <!-- 首屏主题预热：必须留在样式表之前、且是同步外链脚本。
      html 根节点上的 data-theme="dark" 只是无脚本兜底；真实偏好在 localStorage，
@@ -344,7 +347,10 @@ display:none，不补就比「账号」列左 3px。 */
 .realm-tag { display: inline-block; padding: 1px 5px; border-radius: 4px; font: 500 10px/1.1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); white-space: nowrap; vertical-align: middle; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
-.realm-opt input { accent-color: var(--accent); margin: 0; }
+/* 单选框必须收成控件自身宽度：全局 input 是 width:100%，作为 flex 项会把 100%
+   撑到整行，把后面的文字挤到换行（Safari 直接把 radio 压在文字上，issue #202）。
+   同 .radios input 的规避——两个选择器都要写，只写一个另一个就会中招。 */
+.realm-opt input { accent-color: var(--accent); margin: 0; width: auto; flex: none; }
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .usage-cell { min-width: 268px; }
 .usage-line {

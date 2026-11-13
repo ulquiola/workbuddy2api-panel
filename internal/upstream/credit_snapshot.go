@@ -146,6 +146,11 @@ func (c *Client) globalCreditSnapshot(a *auth.Auth, soon time.Duration) (CreditS
 	if uerr := json.Unmarshal(raw, &sum); uerr != nil {
 		return CreditSnapshot{}, fmt.Errorf("billing summary parse: %w", uerr)
 	}
+	// 顺手记下这个号是不是付费号：选号对 exclusive 模型（免费号调不通）据此跳过它。
+	// 零额外请求——这个字段本来就在 summary 里，此前只解析不用（上游 #203 / 7a48d72）。
+	if a != nil {
+		c.NotePaidUser(a.UID, sum.IsPaidUser)
+	}
 	now := time.Now()
 	var remain, total int64
 	codes := make([]string, 0, len(sum.Packages))
