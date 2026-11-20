@@ -8,9 +8,29 @@ import (
 	"encoding/json"
 	"log"
 	"math"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
+
+// reuEscape JS 的 \uXXXX / \u{XXXX} 转义（RE2 没有 \u，只有 \x{...}）。
+var reuEscape = regexp.MustCompile(`\\u\{([0-9a-fA-F]{1,6})\}|\\u([0-9a-fA-F]{4})`)
+
+// re2Pattern 把 JS 正则里 RE2 不认的 \u 转义译成 \x{...}，并验证能编译。
+// 不含 \u 时原样返回（正常 pattern 零额外开销）；译后仍编不过返回 false，由调用方丢弃。
+func re2Pattern(p string) (string, bool) {
+	if !strings.Contains(p, `\u`) {
+		return p, true
+	}
+	q := reuEscape.ReplaceAllStringFunc(p, func(m string) string {
+		return `\x{` + strings.Trim(m[2:], "{}") + `}`
+	})
+	if _, err := regexp.Compile(q); err != nil {
+		return "", false
+	}
+	return q, true
+}
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
@@ -140,16 +160,21 @@ func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][
 	// 历史裁剪先于 tool 配对：cut 落在整轮边界上，不会切出半个 tool 配对；
 	// 万一客户端自己的历史本来就断了，后面的配对步骤照样兜底。
 	trimHistory(obj, keepRounds)
-	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
-	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
-	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
-	// 插在结果中间的非 tool 消息（Codex image_resize_notice）同样判配对断裂，
-	// 先 repack 挪后，再 cleanup 删孤儿，两侧同口径。
+	// tool 配对四步（见 tool_pairing.go）：先修顺序倒置、再合并背靠背声明、再重排、最后清孤儿。
+	// 所有模型一律执行（独立于 deepseek-only 的 sanitize 开关）。这是「让请求通过」的
+	// 安全网——不完整配对的 tool_calls/tool 结果会让上游对之后每条消息都返 400，
+	// 必须先行剔除；插在结果中间的非 tool 消息（Codex image_resize_notice）同样判
+	// 配对断裂，先 repack 挪后，再 cleanup 删孤儿，两侧同口径。
 	//
-	// 顺序不能换：mergeAdjacentToolCalls 必须最先跑——它把「背靠背的两条
-	// assistant.tool_calls」合成一条（部分 agent 客户端回放并行调用的报文形状），是上游
-	// deepseek 系模型 11148 的正面修复；先合并再 repack，repack 才看得到完整的一批调用。
+	// 顺序有两处不能换：
+	//   - reorderEarly 排最前：它只处理「结果早于调用」这一种顺序倒置，倒置没修时
+	//     repack 会把那条早到的 tool 当成普通消息原样留在原地（role != assistant → 直通），
+	//     后面 cleanup 又因两侧 id 都在而判定「配对完整」，倒置就一路带到上游撞 11148。
+	//   - mergeAdjacent 紧跟其后、先于 repack：它把「背靠背的两条 assistant.tool_calls」
+	//     合成一条（部分 agent 客户端回放并行调用的报文形状），是 11148 的正面修复；
+	//     先合并再 repack，repack 才看得到完整的一批调用。
 	if msgs, ok := obj["messages"].([]any); ok {
+		msgs, _ = reorderEarlyToolResults(msgs)
 		msgs, _ = mergeAdjacentToolCalls(msgs)
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
@@ -192,11 +217,9 @@ func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][
 	//   - 空 text 段（11151）：客户端重试只会重放同一段历史，换号也救不回来；
 	//   - reasoning 镜像：Kimi/GLM/MiniMax 等按 `reasoning` 读历史，只看
 	//     reasoning_content 的话它们的多轮一致性校验会挂。
-	// 位置必须在 repack/cleanup 之后：那两步会把字符串 content 挪到别的消息上，
-	// 先补位再挪动等于漏掉被挪过去的那一段。
-	if msgs, ok := obj["messages"].([]any); ok {
-		guardEmptyTextParts(msgs)
-	}
+	// 位置必须在 repack/cleanup 之后（那两步会把字符串 content 挪到别的消息上，先补位
+	// 再挪动等于漏掉被挪过去的那一段），也必须在 sanitize 之后（只含指纹的 text 段会被
+	// 净化洗成空串，先补位的话出站仍带 ""，照样 11151）。
 	mirrorUpstreamReasoning(obj)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
@@ -205,6 +228,9 @@ func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][
 		// tools 是客户端自带的能力声明，描述由客户端作者撰写，同样会带身份句
 		// （上游 issue：只洗 messages 时整段工具描述原样出站）。issue #395 同类。
 		sanitizeTools(obj["tools"], brandGlobal)
+	}
+	if msgs, ok := obj["messages"].([]any); ok {
+		guardEmptyTextParts(msgs)
 	}
 	// 会话轮级字段（issue #51）：本轮已解析好的 map 就地补，与本函数的序列化合并；
 	// 旧实现是在 prepared body 上再 Unmarshal+Marshal 一次（100~500KB 的整树往返）。
@@ -545,8 +571,8 @@ func normalizeStop(obj map[string]any) {
 // openai_responses_to_openai_chat_completions）会把助手历史里的思考片段原样透传进
 // /v1/chat/completions；上游 content 类型白名单不含它，命中即 HTTP 400 code=11101
 // 「unsupported content type at index 0: reasoning_text」。本仓自己的 responses 入站
-// 不产这种片段（客户端回传的 reasoning item 在 convertInputItems 里就丢弃了），这条
-// 是给「链路上游还有别的转换器」兜底。
+// 不产这种片段（客户端回传的 reasoning item 在 convertInputItems 里转成消息级的
+// reasoning_content 字段，不进 content），这条是给「链路上游还有别的转换器」兜底。
 //
 // 思考片段只是模型私有推理，下游续写不需要，剔除无副作用：
 //   - 删除 type 为 reasoning_text / reasoning 的片段（TrimSpace 后比较）
@@ -711,21 +737,305 @@ func normalizeToolPatterns(obj map[string]any) {
 		}
 		// OpenAI 形态 tools[].function.parameters；裸 tools[].parameters 兼容。
 		if fn, ok := tool["function"].(map[string]any); ok {
-			normalizeSchemaTree(fn["parameters"])
+			fn["parameters"] = normalizeToolParameters(fn["parameters"])
 		}
-		normalizeSchemaTree(tool["parameters"])
+		if _, ok := tool["parameters"]; ok {
+			tool["parameters"] = normalizeToolParameters(tool["parameters"])
+		}
 	}
 }
 
+// normalizeToolParameters 归一化工具顶层参数定义（补齐 type: object、补齐 properties: {} 等），
+// 并递归规整深层 Schema 树，彻底根除 11129 invalid_function_call_parameters。
+func normalizeToolParameters(node any) any {
+	if node == nil {
+		return map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	params, ok := node.(map[string]any)
+	if !ok {
+		return map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	// 顶层 $ref：整份参数 schema 指向 $defs 时上游一刀拒收（实测 400 11129），而
+	// 嵌套 $ref 实测 200——只有顶层要处理。能就地展开就展开（保住真实参数定义），
+	// 展不开（非 #/$defs/ 的 ref、目标缺失、循环）也必须删掉：留着等于保证这颗工具
+	// 每次请求都 400，删掉至少退化成一个无参工具。
+	if ref, ok := params["$ref"].(string); ok {
+		delete(params, "$ref")
+		if defs, ok := params["$defs"].(map[string]any); ok && strings.HasPrefix(ref, "#/$defs/") {
+			if t, ok := inlineKimiSchema(map[string]any{"$ref": ref}, defs, nil, 0).(map[string]any); ok {
+				for k, v := range t {
+					if _, dup := params[k]; !dup {
+						params[k] = v
+					}
+				}
+			}
+		}
+	}
+	t, ok := params["type"].(string)
+	if !ok || strings.TrimSpace(t) == "" {
+		params["type"] = "object"
+	} else {
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "str":
+			params["type"] = "string"
+		case "int":
+			params["type"] = "integer"
+		case "float":
+			params["type"] = "number"
+		case "bool":
+			params["type"] = "boolean"
+		case "dict":
+			params["type"] = "object"
+		case "list":
+			params["type"] = "array"
+		}
+	}
+	if params["type"] == "object" {
+		if _, hasProps := params["properties"].(map[string]any); !hasProps {
+			params["properties"] = map[string]any{}
+		}
+	}
+	normalizeSchemaTree(params)
+	return params
+}
+
+// schemaContainerKeys 定义了 JSON Schema 规范中的容器级 map。
+// 容器自身的键是属性名/定义名（用户数据），绝不能当做 Schema 关键字进行判定；
+// 递归时仅遍历其子 Schema 节点。
+var schemaContainerKeys = map[string]bool{
+	"properties":        true,
+	"patternProperties": true,
+	"$defs":             true,
+	"definitions":       true,
+	"dependentSchemas":  true,
+	// dependentRequired 的值是属性名数组、dependencies（draft-7）的值是属性名数组或子
+	// schema：键都是属性名。不当容器，属性名叫 items / type 时会被当成关键字改写
+	// （["type"] 被换成 {"type":"string"}）。
+	"dependentRequired": true,
+	"dependencies":      true,
+}
+
+// schemaDataKeys 取值是**数据**而不是 schema 的关键字：default / const / enum /
+// example(s) 里的对象就是客户端声明的取值本身，里面出现 type、items、required、null
+// 也只是数据。规整只作用于 schema，绝不递归进这些值——否则改写的是模型看到的默认值、
+// 常量和枚举项（如 default {"type":"str"} 被改成 "string"）。
+var schemaDataKeys = map[string]bool{
+	"default":  true,
+	"const":    true,
+	"enum":     true,
+	"example":  true,
+	"examples": true,
+}
+
+// schemaNumberKeys / schemaBoolKeys / schemaStringKeys 三组关键字的**取值类型**同样被
+// 上游按 Go 强类型反序列化校验，类型不符即整体拒收（code=11129，displayMsg「工具定义
+// 不合规」）。2026-11-18 在 www.workbuddy.cn 上逐形态单独实测，每个样本只带一处缺陷：
+//
+//	minimum:"1"        → 400 11129      minimum:1        → 200
+//	uniqueItems:"true" → 400 11129      uniqueItems:true → 200
+//	description:123    → 400 11129      description:"x"  → 200
+//	enum:"x"           → 400 11129      enum:["x"]       → 200
+//	additionalProperties:"false" → 400 11129
+//
+// 弱类型客户端（Python dict、PHP array、手写 JSON 模板）序列化出来就是这些形状；同一
+// 实测里联合类型 type:["string","null"]、oneOf、嵌套 $ref + $defs、items:{}、
+// required 指向不存在的属性全部 200，所以这里只纠这三组与顶层 $ref，不扩面。
+var schemaNumberKeys = []string{
+	"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+	"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties",
+}
+var schemaBoolKeys = []string{"uniqueItems", "deprecated", "readOnly", "writeOnly"}
+var schemaStringKeys = []string{"description", "title", "format", "pattern"}
+
+// coerceSchemaKeywords 把三组关键字的取值纠成上游能接受的基本类型；纠不动就删键
+// （留着一个非法值等于保证整颗工具必然 400，删掉只是丢掉一条约束或注释）。
+func coerceSchemaKeywords(n map[string]any) {
+	for _, k := range schemaNumberKeys {
+		if v, ok := n[k]; ok {
+			if num, ok := schemaNumber(v); ok {
+				n[k] = num
+			} else {
+				delete(n, k)
+			}
+		}
+	}
+	for _, k := range schemaBoolKeys {
+		if v, ok := n[k]; ok {
+			if b, ok := schemaBool(v); ok {
+				n[k] = b
+			} else {
+				delete(n, k)
+			}
+		}
+	}
+	for _, k := range schemaStringKeys {
+		if v, ok := n[k]; ok {
+			if _, isStr := v.(string); !isStr {
+				delete(n, k)
+			}
+		}
+	}
+	if v, ok := n["additionalProperties"]; ok {
+		if _, isSchema := v.(map[string]any); !isSchema {
+			if b, ok := schemaBool(v); ok {
+				n["additionalProperties"] = b
+			} else {
+				delete(n, "additionalProperties")
+			}
+		}
+	}
+	for _, k := range []string{"enum", "examples"} {
+		if v, ok := n[k]; ok {
+			if _, isList := v.([]any); !isList {
+				delete(n, k)
+			}
+		}
+	}
+}
+
+// schemaNumber 纠数值关键字：数字原样，纯数字字符串转数值，其余（bool / 对象 /
+// NaN / Infinity）判非法。encoding/json 解出来的数字一律 float64，故一并返回 float64。
+func schemaNumber(v any) (any, bool) {
+	switch x := v.(type) {
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return nil, false
+		}
+		return x, true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, false
+		}
+		return f, true
+	}
+	return nil, false
+}
+
+// schemaBool 纠布尔关键字：bool 原样，"true"/"false" 转义，其余判非法。
+func schemaBool(v any) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(x)) {
+		case "true":
+			return true, true
+		case "false":
+			return false, true
+		}
+	}
+	return false, false
+}
+
 // normalizeSchemaTree 递归归一化工具参数 schema 树：
+//   - 区分 Schema 节点与 Schema 容器：容器自身键为用户属性名，只对其子 Schema 做规整；
+//   - 剔除值为 nil 的关键字（description: null、title: null 等导致上游反序列化失败），
+//     数据关键字（default / const / enum / example(s)）的 null 保留；
+//   - 类型别名归一化（str/int/bool/dict/list 等 Python 非标类型别名映射至 JSON Schema 标准）；
+//   - 关键字取值类型纠偏（数值/布尔/字符串关键字，见 coerceSchemaKeywords）；
+//   - required 规整（剔除 nil、空字符串及非 string 元素，空列表直接清理）；
+//   - array items 规整（解包 tuple 模式，清理 nil items）；
 //   - pattern 值与 patternProperties 键里的 `\_` → `_`（patternProperties 的键也是正则；
 //     map 键不可原地改，命中时重建该层）；
 //   - 只有 enum、没有 type 的属性补上可无损推断的类型（见 inferEnumType）。
 func normalizeSchemaTree(node any) {
 	switch n := node.(type) {
 	case map[string]any:
-		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
-			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
+		// 0. 关键字取值类型纠偏。放在最前：纠不动的键被删掉，后面的 nil 剔除与类型推断
+		// 就只看剩下的合法值，不必每步都防一次类型。
+		coerceSchemaKeywords(n)
+		// 1. 剔除值为 nil 的关键字（避免上游 Go 强类型反序列化失败报 11129）。
+		// 数据关键字除外：const:null（只能是 null）、default:null（缺省为 null）是有意义的
+		// 取值，删了就改了语义（见 schemaDataKeys）。
+		for k, v := range n {
+			if v == nil && !schemaDataKeys[k] {
+				delete(n, k)
+			}
+		}
+
+		// 2. 类型别名归一化
+		if t, ok := n["type"].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(t)) {
+			case "str":
+				n["type"] = "string"
+			case "int":
+				n["type"] = "integer"
+			case "float":
+				n["type"] = "number"
+			case "bool":
+				n["type"] = "boolean"
+			case "dict":
+				n["type"] = "object"
+			case "list":
+				n["type"] = "array"
+			case "":
+				if _, hasProps := n["properties"]; hasProps {
+					n["type"] = "object"
+				}
+			}
+		}
+
+		// 3. 规整 required 字段。重复项也要去重：`["a","a"]` 实测同样 400 11129。
+		if req, hasReq := n["required"]; hasReq {
+			if reqList, ok := req.([]any); ok {
+				var cleaned []any
+				seen := make(map[string]bool, len(reqList))
+				for _, item := range reqList {
+					if s, ok := item.(string); ok {
+						s = strings.TrimSpace(s)
+						if s != "" && !seen[s] {
+							seen[s] = true
+							cleaned = append(cleaned, s)
+						}
+					}
+				}
+				if len(cleaned) == 0 {
+					delete(n, "required")
+				} else {
+					n["required"] = cleaned
+				}
+			} else {
+				delete(n, "required")
+			}
+		}
+
+		// 4. 规整 array items
+		if items, hasItems := n["items"]; hasItems {
+			if items == nil {
+				delete(n, "items")
+			} else if itemList, ok := items.([]any); ok {
+				var firstDict map[string]any
+				for _, it := range itemList {
+					if d, ok := it.(map[string]any); ok {
+						firstDict = d
+						break
+					}
+				}
+				if firstDict != nil {
+					n["items"] = firstDict
+				} else {
+					n["items"] = map[string]any{"type": "string"}
+				}
+			}
+		}
+
+		// 5. pattern 转义修复
+		//   - `\_`（JS 正则里非法的转义，上游 RE2 也不认）：去掉反斜杠；
+		//   - `\uXXXX` / `\u{XXXX}`（JS 合法、RE2 没有 \u 转义）：换成等价的 \x{XXXX}。
+		//     issue #276：REA 6.9.0 给每个路径字段挂 ^[^\uD800-\uDFFF]*$，上游按 RE2
+		//     解析 → 400/11129「tools 不合规」，整个 tools 请求被拒，客户端所有工具都用
+		//     不了。译完仍编不过（混了别的 RE2 不认的语法）就丢掉这个 pattern：丢它只是
+		//     放宽一条本地正则，留着等于让整包工具被上游否掉。
+		if p, ok := n["pattern"].(string); ok {
+			if strings.Contains(p, `\_`) {
+				p = strings.ReplaceAll(p, `\_`, `_`)
+			}
+			if fixed, compiled := re2Pattern(p); compiled {
+				n["pattern"] = fixed
+			} else {
+				delete(n, "pattern")
+			}
 		}
 		if props, ok := n["patternProperties"].(map[string]any); ok {
 			rebuilt := false
@@ -741,9 +1051,8 @@ func normalizeSchemaTree(node any) {
 				n["patternProperties"] = fixed
 			}
 		}
-		// enum 缺 type：Kimi 系对参数 schema 严格校验，直接 400 11133「Invalid request
-		// parameters」——同一个模型对带这类 schema 的客户端等于全废。类型能无损推断就补上，
-		// 推断不出来（混合标量/含 null）保持原样，让上游按原语义报错，不猜。
+
+		// 6. enum 缺 type 自动推断
 		if _, hasType := n["type"]; !hasType {
 			if e, ok := n["enum"].([]any); ok && len(e) > 0 {
 				if t := inferEnumType(e); t != "" {
@@ -751,7 +1060,24 @@ func normalizeSchemaTree(node any) {
 				}
 			}
 		}
-		for _, v := range n {
+
+		// 7. 递归子树：容器键只遍历子 Schema，防止容器键（如属性名 required）被当成 Schema 关键字误删
+		for k, v := range n {
+			if schemaDataKeys[k] {
+				continue // 数据值，不是 schema（见 schemaDataKeys）
+			}
+			if schemaContainerKeys[k] {
+				if c, ok := v.(map[string]any); ok {
+					for childKey, child := range c {
+						if child == nil {
+							delete(c, childKey)
+							continue
+						}
+						normalizeSchemaTree(child)
+					}
+				}
+				continue
+			}
 			normalizeSchemaTree(v)
 		}
 	case []any:

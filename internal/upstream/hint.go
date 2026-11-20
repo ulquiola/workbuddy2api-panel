@@ -11,6 +11,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -29,6 +30,21 @@ import (
 // ErrBadParams 皆有可能（Classify 词表不含 11133），hint 层自带判定（hint 是补充
 // 说明非权威分类，误判代价只是多一条中性补充说明）；其余走 Kind 一对一映射。
 func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
+	// 11103「Backend [x] is not supported」：模型的上游后端没启用/配置不全。上游自带的
+	// displayTips 就是「请换其他模型」，但客户端看到的那份在工作区里、日志里只剩一句
+	// 英文；这里点名「换号无用」，省掉一轮全池轮转与「账号是不是挂了」的误判。
+	if hasBusinessCode(msg, "11103") || codeMarker(strings.ToLower(msg), "11103") {
+		return "this model's backend is not enabled upstream (11103); switching accounts will not help — switch model"
+	}
+	// 音色未配置（TTS）：上游 500 + code 10000，与账号无关。必须排在 ErrBadParams
+	// 的通用文案之前，否则客户端只会看到「参数被拒」而不知道该省掉 voice。
+	if strings.Contains(strings.ToLower(msg), "get voice config failed") {
+		return `voice is not configured upstream (not an account problem); omit "voice" to use the default ` + TTSDefaultVoice
+	}
+	// 15053 ASR recognition failed：上游解不出这段音频（裸 PCM 无容器头必现，实测）。
+	if codeMarker(strings.ToLower(msg), "15053") {
+		return "upstream could not recognise this audio (15053); send a WAV or WebM container — bare PCM has no header to sniff"
+	}
 	// 11133 model_param_invalid 家族（图片回归实测：不支持图片的模型传图，或任意
 	// 参数被模型供应商拒绝）。只有请求确实带图、且目录**显式声明**该模型不支持图片
 	// 时才给「换模型」指向——目录只收录而不声明该能力（缺键）时无从判断，退中性
@@ -64,6 +80,11 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		// 是一个永远不会兑现的承诺（issue #191 的延伸）。
 		return "account credits exhausted at upstream; CN accounts recover via the next daily check-in, global accounts need a top-up"
 	case ErrUpstreamBusy:
+		// 11134 供应商过载：同属容量信号，但不是排队——换个模型是有效出路，说「队列满」
+		// 会把人引去查排队。
+		if IsProviderOverloaded(msg) {
+			return "the upstream model provider is temporarily overloaded (not an account problem); retry after the Retry-After delay or switch to another model"
+		}
 		// 6021 queue.full：渠道级容量满载。措辞明确「不是账号问题、换号无意义」，
 		// 指引客户端短等待后重试（SDK 指数退避天然适配）。
 		return "upstream admission queue is full (channel-level capacity, not an account problem); retry after a short wait"
@@ -82,8 +103,15 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
 		// （handler_test 的泄漏守卫），hint 遵守同一口径。
 		return "request content was rejected by content policy; adjust the prompt and retry"
+	case ErrBadParams:
+		// 11129/11152：整颗工具定义被拒（schema 形态或工具名），换号重试必然复现。
+		// 上游原文只说「工具定义不合规」，客户端看不出该改哪儿，这里点名是 tools。
+		if isToolSchemaRejected(msg, strings.ToLower(msg)) {
+			return "the request's tool definitions were rejected by upstream (schema shape or tool name); fix or drop the offending tool — retrying as-is fails the same way"
+		}
+		return ""
 	default:
-		// ErrNone/ErrNotFound/ErrServer/ErrBadParams/ErrClient 等未覆盖形态：无 hint。
+		// ErrNone/ErrNotFound/ErrServer/ErrClient 等未覆盖形态：无 hint。
 		return ""
 	}
 }
@@ -136,6 +164,27 @@ func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 	}
 }
 
+// frameRequestCodes 首帧 error 帧里按 error.code 直接定类的请求级错误。帧路径 code 优先；
+// HTTP 路径的 Classify 先判限流文案，所以 11115 配「too many tokens」之类措辞时 HTTP 上仍是
+// ErrSoftRate，两条路径在这个边角上不一致，本表不去改 Classify。
+// 11101 不在内：它与图片文案共用 code，须交给 Classify 的文案优先序。
+var frameRequestCodes = []struct {
+	code string
+	kind ErrKind
+}{
+	{"11115", ErrPromptTooLong},
+	{"11129", ErrBadParams},
+	// 11103 后端未启用：请求级（换号无用），与 Classify 的 400 分支同口径。
+	{"11103", ErrModelParamInvalid},
+	// 11152 工具名不合规/重名：与 11129 同类（错在客户端声明的 tools），不登记就会滑到
+	// 通用 4xx → 喂连败 + 轮转全池 + 末端 503（2026-11-18 真机实测）。
+	{"11152", ErrBadParams},
+	{"11133", ErrModelParamInvalid},
+	{"11135", ErrImageInvalid},
+	{"11148", ErrToolMismatch},
+	{"11151", ErrEmptyContent},
+}
+
 // FrameKind 从 SSE error 帧 payload 判定 ErrKind：6004 模型级限流的流式形态
 // （IsModelRateLimit 对帧 JSON 直接命中）优先；其余取帧内 error.message 走
 // Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
@@ -143,12 +192,33 @@ func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate
 	}
+	// 11140 账号风控限制文书要 code + 文案同时成立，而 code 在帧的 error.code 上、不在
+	// message 里：只拿 message 去 Classify 会把它判成普通 4xx，首帧否决后照样换号。
+	if IsRestricted(payload) {
+		return ErrAccountFault
+	}
+	// 请求级错误以业务码为准：帧里 code 在 error.code 上，只拿 message 去 Classify 会丢掉它，
+	// 而 message 措辞不保证带已知文案（11129 可能是英文原文 / 下划线形态 / 中文 displayMsg，
+	// 11133 的真实措辞不含 isModelParamInvalid 的任何文案 marker，11151 在 Classify 里只认结构化
+	// code）——判成普通 4xx 后首帧否决照样换号、末端 503。
 	var f struct {
 		Error struct {
+			Code    any    `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if json.Unmarshal([]byte(payload), &f) != nil || f.Error.Message == "" {
+	if json.Unmarshal([]byte(payload), &f) != nil {
+		return ErrNone
+	}
+	if f.Error.Code != nil {
+		code := strings.TrimSpace(fmt.Sprint(f.Error.Code))
+		for _, c := range frameRequestCodes {
+			if code == c.code {
+				return c.kind
+			}
+		}
+	}
+	if f.Error.Message == "" {
 		return ErrNone
 	}
 	return Classify(http.StatusBadRequest, f.Error.Message)

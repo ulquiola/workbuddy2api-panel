@@ -65,7 +65,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；**运行日志按天落盘**（重启回填、按今日/3 天/7 天导出 ZIP）；**上游劣化滑窗告警**（5 分钟窗内 TTFB≥8s 占比≥30% 或 5xx≥10% 时打一条聚合 WARN——「全 200 但每个请求 20 秒」这种无告警停摆从此可见）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
-| 🎬 **媒体生成 + MCP** | 生图 / 改图 / 出视频（异步任务，可阻塞等结果）与 `POST /mcp`（MCP 工具：生成图片、改图、生成视频、查任务、列媒体模型）；记账、换号、错误策略与对话走同一条路径。另有**可选**的「裁掉右下角水印」后处理（默认关闭） |
+| 🎬 **媒体生成 + MCP** | 生图 / 改图 / 出视频（异步任务，可阻塞等结果）与 `POST /mcp`（MCP 工具：生成图片、改图、生成视频、查任务、列媒体模型）；记账、换号、错误策略与对话走同一条路径。另有**可选**的「裁掉右下角水印」后处理（默认关闭）。3D 生成（`/v1/3d/*` + `generate_3d` / `get_3d_task`）代码已就绪但**默认关闭**，打开后临时云凭证由网关用已登录账号自动签发（默认，无须手工收集；也可手工覆盖，见下） |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题），账号运维 / 模型档位查询 / 在线改配置（热生效）/ 运行日志 / 积分任务，见 [Web 管理面板](#-web-管理面板) |
 | 🧩 **工具调用合并** | 出站 payload 把背靠背的 `assistant.tool_calls` 合并为一条（部分 agent 客户端回放并行调用的报文形态），修复上游 deepseek 系 `11148` |
 | 🏷️ **本地备注名** | 账号池点击昵称就地编辑；备注存 `state.json`（`alias`），与上游昵称独立、昵称同步不覆盖；账号池 / 用量 / 到期提醒 / 任务中心 / 套餐统一显示 |
@@ -86,6 +86,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | GET | `/v1/videos/{task_id}` | 查任务（`queued` / `in_progress` / `completed` / `failed`） |
 | GET | `/v1/videos/{task_id}/content` | 取成品字节（流式转发签名直链，不落盘；任务没出片回 409） |
 | POST | `/v1/videos/tasks` | 查任务，body `{"task_id":"..."}`（给不方便用路径参数的客户端） |
+| POST | `/v1/3d/generations` | 文生 / 图生 3D；默认异步返回 `job_id`（需 `features.three_d_enabled`） |
+| POST | `/v1/3d/tasks` | 查 3D 任务，body `{"job_id":"..."}` |
+| GET | `/v1/3d/{job_id}` | 查 3D 任务 |
 | POST | `/v1/images/strip-watermark` | 裁掉底部纯白留白（顺带去水印），默认关闭；见「去水印」 |
 | POST | `/mcp` | MCP（JSON-RPC 2.0，Streamable HTTP 形态），见下 |
 
@@ -153,6 +156,60 @@ curl -s http://127.0.0.1:7863/v1/videos/1312831544-WandVideo-… \
 - **任务是账号级可见**：上游任务只对提交它的账号可见，账号结构里没有数字租户 id 可以反推，所以网关自己维护「task → 账号」台账；**台账在进程内存里**，重启后查询会退化成逐个账号试、命中即收养（此时若上游不再回 `usage`，这次查询就不带积分明细，但也不会重复扣费）。
 - **kling 慢一个量级**：MCP 默认 `wait=true`，客户端超时要给到 15 分钟以上；只想拿任务号就传 `wait=false`。
 
+### 生 3D（异步任务，默认关闭）
+
+> **状态说明（请先读）**：这条链路要的是官方签发的 `ck_t_` 形式**临时云凭证**，不是账号的 OAuth
+> access token。签发协议已从官方桌面客户端（5.9.3）静态提取并于 **2026-11-14 真机验证通过**：
+> 网关默认用已登录账号自己的 access token 调官方 `/v2/api-keys` 自动签发（与官方客户端
+> `connect_cloud_service` 同款行为），提交 → 轮询 → 终态 → 计费 → 产物下载全链路实测可用，
+> 约 30 积分/次（3.1 文生 + PBR），产物为 COS 签名直链。
+
+开启（`config.json`）——默认零配置，打开开关即可：
+
+```json
+{
+  "features": {
+    "three_d_enabled": true
+  }
+}
+```
+
+凭证怎么来（`features.three_d_auto_token`，默认 true）：
+
+- **自动签发**：网关拿提交账号的 access token 调 `POST /v2/api-keys`
+  （body `{name:"workbuddy-connect-cloud-service", expire_in_seconds:900, temporary:true}`）换
+  `ck_t_`，按账号缓存到过期前，上游 401/403 拒绝时自动重签；并发同账号只签一次。请求的 900s
+  TTL 上游并不严格执行（实测签发 27 分钟后仍有效）。静态 API Key 账号（`ck_`/`pt_` 前缀）没有
+  OAuth 身份，签不出来，该账号的 3D 请求回 503。
+- **手工覆盖**：`three_d_temp_tokens` 仍然可用，键是账号 UID、`"*"` 兜底；填了的账号直接用手工
+  凭证、不再签发。显式 `"three_d_auto_token": false` 可整体退回「只用手工凭证表」。
+- 凭证只进内存，不写日志、不回显到面板、不进错误信息。
+
+`three_d_temp_tokens` 的键是账号 UID，特殊键 `"*"` 作为兜底（不区分账号的凭证）。凭证只进内存，
+不写日志、不回显到面板、不进错误信息；官方 TTL 未证实，过期后上游会拒绝，换一份即可。
+
+```bash
+curl -s http://127.0.0.1:7863/v1/3d/generations \
+  -H "Authorization: Bearer $WB2API_KEY" -H 'Content-Type: application/json' \
+  -d '{"prompt":"Q版古代灯笼，PBR材质","model":"3.1","enable_pbr":true}'
+# → {"job_id":"…","status":"SUBMITTED"}
+
+curl -s http://127.0.0.1:7863/v1/3d/tasks \
+  -H "Authorization: Bearer $WB2API_KEY" -H 'Content-Type: application/json' \
+  -d '{"job_id":"…"}'
+```
+
+MCP 对应 `generate_3d` / `get_3d_task`（开关关闭时这两个工具不出现在 `tools/list` 里）。文本、`image_url`、`image_base64` 或 `multi_view_images` 至少给一种；支持 `model=3.0|3.1`、`enable_pbr`、`face_count`（10000～1500000）、`generate_type`、`polygon_type`、`result_format`。`LowPoly` 需要 3.0；`Sketch` 需要 prompt 加图片，不支持 3.1；`polygon_type` 仅用于 LowPoly。多视角需同时给单图 `image_url`/`image_base64`，不能与 prompt 同时提供；视角枚举为 `back`、`left`、`right`、`top`、`bottom`、`left_front`、`right_front`。默认 `wait=false`；`wait=true` 时每个进程最长等待 600 秒，`timeout_seconds` 只能把这段时间**缩短**、不能延长。
+
+几个边界要清楚：
+
+- **凭证缺失 / 开关关闭**：分别是 `503 three_d_credential_missing` 与 `403 three_d_disabled`，都不打上游。
+- **上游鉴权**：TC3-HMAC-SHA256，`Credential=hy-3d.<临时凭证>`，service `ai3d`、version `2025-05-13`、region `ap-guangzhou`；签名算法与凭证签发均已真机验证。
+- **查询回到提交账号**：任务台账在进程内存；**重启后**查询退化为有界探测（与视频同一套：负缓存 / 每分钟额度 / 换号），命中即收养。探测撞限流只暂停探测，不罚账号。
+- **记账**：查到终态且有 `ResultCreditConsumed` 时按积分记一次，重复查询、并发查询都只记一次；用量快照存在台账里，后续查询仍能看到 `usage.credit`。
+- **重启收养终态任务不补记账**：避免给重启前可能已经记过的任务重复计费；若从未观察过终态，重启后才查到 DONE 的任务可能漏记。
+- **单租户前提**：网关只有一个共享 API key，台账只记「提交账号」不记「调用方」——持有 key 即可查任意 `job_id`。这与视频功能是同一信任模型，多租户场景请勿直接暴露。
+
 ### MCP 端点（`POST /mcp`）
 
 MCP 端点走 **Streamable HTTP** 的纯 POST 形态（不提供 SSE 流、不维护 session）：客户端发一条 JSON-RPC 就回一条 JSON-RPC。鉴权与 REST 相同（`Authorization: Bearer <api_key>`）；`GET /mcp` 回 405 + `Allow: POST`（客户端据此退回纯 POST）。
@@ -163,7 +220,7 @@ curl -s http://127.0.0.1:7863/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}'
 ```
 
-工具（5 个）：
+工具（7 个；`generate_3d` / `get_3d_task` 仅在 `features.three_d_enabled` 打开时出现，`strip_watermark` 仅在 `features.watermark_strip_enabled` 打开时出现）：
 
 | 工具 | 说明 |
 |---|---|
@@ -172,6 +229,8 @@ curl -s http://127.0.0.1:7863/mcp \
 | `edit_image` | 改图，参数 `prompt`（必填）、`image`（URL 或 `data:` URL，必填）、`model` |
 | `generate_video` | 出视频，参数 `prompt`（必填）、`model`、`seconds`、`resolution`、`aspect_ratio`、`negative_prompt`、`enable_audio`、`image`、`last_image`、`wait`（缺省 `true`） |
 | `get_video_task` | 查任务 / 收片，参数 `task_id` |
+| `generate_3d` | 文生 / 图生 3D，默认返回 `job_id`；支持模型版本、PBR、面数和多视角输入 |
+| `get_3d_task` | 查 3D 任务，参数 `job_id`；返回 GLB/OBJ 产物与实际积分用量 |
 
 客户端配置（Claude Code / DSH / 任何支持 HTTP MCP 的宿主）：
 
@@ -247,11 +306,15 @@ socks5h://127.0.0.1:1081
 
 分区默认出口（面板「代理池 → 分区默认出口」）按 realm 指定：`cn` 与 `global` 各一条，账号行没单独指定代理时取它。查表顺序是**账号绑定 > realm 默认 > 随机池 > 直连**——账号行里点过「直连」的号不会被 realm 默认覆盖。
 
-池为空时默认随机使用直连。池中已有节点但没有可用节点时返回错误。代理故障不处罚账号，不触发额外换号重试。聊天、图片、搜索、嵌入、token 刷新、余额和账号后台任务使用同一账号路由入口。未关联账号的 OAuth 授权与更新下载沿用原出站行为。
+池为空时默认随机使用直连。池中已有节点但没有可用节点时返回错误。代理故障不处罚账号，不触发额外换号重试。聊天、图片、搜索、嵌入、token 刷新、余额和账号后台任务使用同一账号路由入口。加号（OAuth 登录）另有一条专用规则，见下；更新下载沿用原出站行为。
+
+**加号出口（`features.login_bind_proxy`，缺省 `true`，热生效）**：登录那一刻账号还不存在，上面那张查表三级在它身上全部落空，旧行为必然是直连机房 IP。打开这个开关后，`POST /panel/api/login/start` 先从号池里随机挑一条**启用**节点（优先「启用且健康」），`auth/state`、`auth/token`、`login/account` 三个端点全部经这条出口发出；账号落盘后立刻写成该号的**固定绑定**，随后的注册激活、签到、余额刷新与所有任务/聊天都走同一条出口——「哪条 IP 注册的号就一直用哪条」。一条启用节点都没有（或开关关掉）时回落直连并在日志里留一行，不让没配代理的部署因此加不了号；有启用节点但一条都不健康时**仍从启用节点里挑**，宁可让这次登录报代理错误、用户重试，也不静默换成机房 IP。登录响应的 `proxy` 字段回显本次出口（`直连` 或 `代理 <节点名>`），完成时的 `login/poll` 也会回显绑定结果。
 
 HTTP/HTTPS 使用标准代理传输；`socks5` 在本机解析目标域名，`socks5h` 由代理解析。各节点复用独立连接池，沿用现有 DNS、TLS、响应头超时和流式空闲控制。禁用或删除只关闭空闲连接，在途请求继续完成。
 
 自动测活默认每 60 秒运行，单次超时 10 秒，最多 8 个节点并发。默认检测 `https://www.workbuddy.cn/`，最终响应为 2xx/3xx 即成功。新增节点与重启后的节点先检测，首次成功后进入候选；连续失败 3 次自动禁用，之后连续成功 2 次恢复。面板可修改 URL、间隔、超时与阈值，也可单独或全部检测。手动禁用优先，检测成功仍保持禁用。业务限流、余额不足等响应不影响测活状态。
+
+`features.proxy_exit_lookup`（缺省 `false`，热生效）打开后，代理健康探测成功时**经该代理**向 `ip-api.com` 查一次出口画像（出口 IP、国家、住宅或机房、ISP、ASN），每个节点 6 小时内不重查，面板代理行显示出口信息，出口 IP 变化时打一行日志。用于排查「同一机房的多个出口一起被降权」。只做观测，不参与选号；查不到就空着。打开即意味着每个节点定期向这个第三方发一次请求；免费档只有明文 HTTP，代理运营方能看到这次请求。
 
 节点、手动启停、账号绑定与测活设置原子保存到 `state_file` 同目录的 `proxy-pool.json`，健康状态仅保存在内存。代理列表、接口响应和错误日志不返回密码；编辑时密码留空保持原值，从 URL 删除用户名可移除认证。被账号或 realm 默认引用的节点禁止删除（HTTP 409），需先解除引用；从面板删除账号时同步清理绑定。
 
@@ -333,7 +396,7 @@ HTTP/HTTPS 使用标准代理传输；`socks5` 在本机解析目标域名，`so
 
 任务计分走 `/v2/report` 行为上报，但**不同任务认不同客户端指纹**：CLI 指纹（`www.codebuddy.cn`）、桌面指纹（`copilot.tencent.com` + `desktopUAFor` 给出的桌面 UA + `workbuddy-desktop` 事件族）、web 指纹（`www.workbuddy.cn` + Node/axios 形态的 `/v2/report`）。网关为每类任务构造对应指纹的判据事件链（`internal/upstream/desktop.go`）；专家类任务额外要求真实专家 id 与真实对话回执（`internal/upstream/streak.go` 之外的 expert 序列）。上报 200 ≠ 计分——面板在执行后轮询任务进度，达标即自动调用 Web 域领奖接口。
 
-> 两个曾经写错、已按真机抓包纠正的点：桌面 UA 不是硬编码版本号，而是与业务链路同源的 `desktopUAFor`（版本由配置驱动，CN 5.9.3 / GL 5.9.4）；**`/v2/report` 路径**不带 `x-client-platform`、`Origin`、`Referer` 或任何 `sec-ch-*`——官方 report 是纯 Node 形态的 11 个头，往这里补 Client Hints 反而是破功。别把两处混为一谈：`/console/account`（`profile.go`）与任务领奖端点（`tasks.go`）**确实**带 `x-client-platform: web`，那是另一条链，删了必坏。
+> 两个曾经写错、已按真机抓包纠正的点：桌面 UA 不是硬编码版本号，而是与业务链路同源的 `desktopUAFor`（版本由配置驱动，CN 5.11.3 / GL 5.9.4）；**`/v2/report` 路径**不带 `x-client-platform`、`Origin`、`Referer` 或任何 `sec-ch-*`——官方 report 是纯 Node 形态的 11 个头，往这里补 Client Hints 反而是破功。别把两处混为一谈：`/console/account`（`profile.go`）与任务领奖端点（`tasks.go`）**确实**带 `x-client-platform: web`，那是另一条链，删了必坏。
 
 > ⚠️ 行为事件按天幂等：重复点「一键完成」不会重复扣资源，已达标的任务自动跳过。
 > 补充（issue #174）：**白名单外**的任务只要进度已达标也会入队，以「只领奖」形态执行（不跑任何动作、不消耗对话配额）——避免任务达标但没人 claim、积分卡在 2000/2100/2300 上不去。
@@ -344,9 +407,21 @@ HTTP/HTTPS 使用标准代理传输；`socks5` 在本机解析目标域名，`so
 
 - **全账号任务扫描**：一键拉取每个账号未完成且可自动化的成长任务（含小程序口径），列表一目了然
 - **执行队列**：把待办按账号排队执行——账号内串行（与单任务/一键完成共用互斥锁），账号间可选并发（1-3）；执行进度实时更新到每个条目。**同一队列也可按排程每日自动跑**（`schedule.growth_hours`，默认 11 点；排程轮次账号间固定串行）
+- **实时任务卡**（`GET /panel/api/tasks/live`）：进入页面即拉，按所选间隔（关 / 1 / 2 / 5 分钟，默认 2 分钟，选择记在浏览器本地）自动刷新，不需要先点扫描；只有还有待办 / 可领 / 查询失败的账号才列任务，全部领完的只计入汇总。一轮对每个启用账号发一次任务表 GET（国内版小程序口径、国际版默认口径，失败不重试），后端缓存 60 秒（多标签页共用，`fresh=1` 在 15 秒内仍回缓存），同一时刻只跑一轮且在后台进行——请求最多等 25 秒，之后带着上一份快照返回（`refreshing: true`）。页面不在前台（切走视图 / 标签页在后台）不轮询，账号任务弹窗的 30 秒静默刷新同样遵守
 - **日志分频道**：运行日志按「任务 / 对话 / 系统」三个频道筛选——对话流量再大，任务结果也不会被冲掉；日志条目带频道徽标与时间
 
 任务中心扫描会合并小程序口径待办（`Sequential_Tasks_*`，默认列表不可见）。accept 带登记回读：上游有过 200 但没落账的情况，未生效会再试一次。
+
+### 🧱 模型规则（面板新视图）
+
+贵模型（`deepseek-v4-pro`、`kimi-k3.1-pro` 这类）只给少数账号用，其余账号只跑便宜常用模型——否则一个号把自己的额度打穿，整个池子连便宜模型都跟着不可用。逐条点 `model_toggle` 太慢，所以做成「规则」：一条规则是一批模型 + 黑/白模式，挂到账号上即刻生效，改规则内容时所有挂了它的账号一起变。
+
+- **黑名单（deny）**：规则里的模型对该账号不可用；**白名单（allow）**：只有规则里的模型可用。多条 deny 取并集、多条 allow 取并集，**deny 优先**
+- 模型名可带 `cn:` / `global:` 前缀区分域；不带前缀＝两个域都命中。一条 allow 规则若在该账号所属域**一个模型都没命中**（典型的跨域误挂），视作没挂，不会把这个号静默封死（规则卡上标 `仅 cn 域` 提示）
+- 与 `model_toggle` 手动单点开关叠加（任一为禁即禁），但**都优先于**自动冷却；规则不会自愈，重启后从 `state.json` 的 `model_rules` 恢复
+- 规则卡片上的「应用」可一次给一批账号挂/摘同一条规则
+
+**错误码**：本域所有可选账号都被规则挡住某个模型时，`/v1/chat/completions` 回 **400 `model_not_allowed`**（不是 503 `no_healthy_account`——规则不会自愈，503 会被客户端当成上游抖动反复重试），`error.gateway_hint` 带 `model_rules: N/M account(s) blocked by model rules`。换模型才有用。
 
 ### 连登兑换与抽奖（自动）
 

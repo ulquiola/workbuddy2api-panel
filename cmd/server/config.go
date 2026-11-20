@@ -262,7 +262,7 @@ type Config struct {
 		// 直接复位，CN 模型目录与对话全部 EOF；需要时用它填这个键回落。
 		ChatBase string `json:"chat_base"`
 		// BillingBase 国内 billing/growth 上游 base 覆盖；空 = 内置默认
-		// https://www.workbuddy.cn（2026-10-28 起对齐 WorkBuddy 5.9.3 客户端：
+		// https://www.workbuddy.cn（2026-10-28 起对齐 WorkBuddy 桌面端：
 		// 客户端把 CN 全部 billing/activity 都打到 workbuddy.cn）。
 		// 旧口径是 www.codebuddy.cn（CodeBuddy CLI 时代，按 CLI 指纹点亮任务用），
 		// 需要退回时填 "https://www.codebuddy.cn"。
@@ -287,9 +287,9 @@ type Config struct {
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
 		UserAgent string `json:"user_agent"`
 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
-		// X-IDE-Version）。空 = 内置默认（对齐官方 5.5.4 分发包）。
+		// X-IDE-Version）。空 = 内置默认（对齐官方 CN 5.11.3 / GL 5.9.4 分发包）。
 		ClientVersion string `json:"client_version"`
-		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（CN 包内置 CLI 2.176.0 / GL 2.165.0）。
 		CliVersion string `json:"cli_version"`
 		// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
 		// 空 = 旧行为 X-Product="SaaS" 不设 X-IDE-*；配 "WorkBuddy" 则四头跟随。
@@ -319,6 +319,21 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// LoginBindProxy 加号（OAuth 登录）是否绑定号池出口，缺省 true。
+		//
+		// true = 登录请求本身也从号池里挑一条启用节点出网，账号落盘后写成该号的
+		// 固定绑定；false = 保持旧行为（登录直连，账号未绑定前一切出站按 realm 默认）。
+		//
+		// 为什么值得默认开：登录那一刻 uid 还不存在，绑定表里没有可查的键，旧行为
+		// 必然直连机房 IP；而「先在这个 IP 上注册、之后换成代理用」本身就是风控眼里
+		// 的强关联信号，且事后查不出这号是哪个出口注册的。开着它，加号与后续任务
+		// 走同一条出口。池里没有任何启用节点时仍回落直连（不能让没配代理的部署
+		// 因此加不了号）。热生效（livecfg 快照，取反成 LoginBindOff）。
+		LoginBindProxy bool `json:"login_bind_proxy"`
+
+		// ProxyExitLookup 代理健康探测时经该代理查一次出口画像（国家 / 住宅或机房 / ISP，
+		// proxypool/intel.go），缺省 false，热生效。每个节点每 6 小时一次第三方请求（ip-api 免费档仅明文 HTTP）。
+		ProxyExitLookup bool `json:"proxy_exit_lookup"`
 		// SanitizeBrandScope 身份类规则（品牌词）作用域："all" = 所有消息角色（默认，与上游既有行为一致）；
 		// "identity" = 仅 system/developer，其余角色按用户数据原样透传（features.sanitize_brand_scope）。
 		SanitizeBrandScope string `json:"sanitize_brand_scope"`
@@ -329,6 +344,32 @@ type Config struct {
 		// 「功能存在、只是没开」，不用去猜路径拼错）。
 		EmbeddingsEnabled bool `json:"embeddings_enabled"`
 
+		// TTSEnabled / ASREnabled 官方语音端点（/v1/audio/speech、/v1/audio/transcriptions）
+		// 的总开关，缺省 false。
+		//
+		// 为什么默认关：这两个端点是官方独立端点、不在 /v1/models 目录里，协议来自官方桌面端包的静态反查（issue #277：
+		// POST /v2/audio/speech 的 SSE + PCM、POST /agenttool/v1/asr 的 multipart），
+		// 没有真机抓包对照过，也还没人验证过不同账号/套餐是否都能用。关闭时端点仍在，
+		// 回 403（不是 404），打开开关即热生效。
+		TTSEnabled bool `json:"tts_enabled"`
+		ASREnabled bool `json:"asr_enabled"`
+
+		// NarrationEnabled 预告式收尾救援的总开关（「……：」「我将…」这类停在半句上就
+		// 结束的回复，网关补发一次续写），缺省 true。
+		//
+		// 为什么终于给了开关（issue #273 第二条评论）：这条救援是往对话里插一条 user
+		// 消息再打一次上游，agent 类客户端分辨不出它与真实用户输入的区别——实测被当成
+		// 用户授权执行了 9 分钟工具调用，且客户端历史里完全查不到这条。默认开启是因为
+		// issue #245 的长会话断写确实靠它；不需要的部署关掉即可，关后行为回到「模型说停
+		// 就停」，同一请求不再多付一次整段 prompt。热生效（livecfg 快照）。
+		NarrationEnabled bool `json:"narration_enabled"`
+
+		// BusyRetry 6020/6021 渠道排队时，先在网关内按上游 retry_after 等一轮再试一次，
+		// 避免把「等 40 秒就好」的排队当成不可重试错误甩给客户端（默认 true）。
+		BusyRetry bool `json:"busy_retry"`
+		// BusyWaitSeconds 单次排队等待上限（秒，默认 60）。0 = 用默认；负数 = 不等。
+		BusyWaitSeconds int `json:"busy_wait_seconds"`
+
 		// WatermarkStripEnabled 实验特性：水印裁切端点 POST /v1/images/strip-watermark
 		// 与 MCP 工具 strip_watermark 的总开关，默认 false。
 		//
@@ -338,6 +379,30 @@ type Config struct {
 		// 1%），所以不适合当默认行为。关闭时端点回 403 watermark_strip_disabled，
 		// MCP 工具不出现在 tools/list 里。面板保存后经 livecfg 热生效。
 		WatermarkStripEnabled bool `json:"watermark_strip_enabled"`
+
+		// ThreeDEnabled 混元 3D 生成（POST /v1/3d/* 与 MCP 工具 generate_3d /
+		// get_3d_task）的总开关，默认 false。
+		//
+		// 打开后凭证由 ThreeDAutoToken 自动签发（用账号自己的 access token 调官方
+		// /v2/api-keys 换 ck_t_，协议见 internal/upstream/three_d_credential.go），
+		// 不再需要手工收集凭证。关闭时端点回 403 three_d_disabled，
+		// MCP 工具不出现在 tools/list 里。
+		ThreeDEnabled bool `json:"three_d_enabled"`
+
+		// ThreeDTempTokens 手工配置的 `ck_t_` 临时云凭证，键 = 账号 UID，特殊键 "*"
+		// 作为兜底（不区分账号的凭证）。见 internal/upstream/three_d_credential.go。
+		//
+		// 敏感字段：只进内存，不写日志、不回显到面板、不进错误信息。作为自动签发的
+		// **手工覆盖**：填了的账号直接用这份凭证，不再签发；留空 = 全走自动签发。
+		ThreeDTempTokens map[string]string `json:"three_d_temp_tokens"`
+
+		// ThreeDAutoToken 自动签发临时云凭证（默认 true）：打开 3D 后网关用已登录
+		// 账号自己的 access token 调官方 /v2/api-keys 换 ck_t_（官方客户端
+		// connect_cloud_service 同款协议，2026-11-14 真机验证），按账号缓存到过期前，
+		// 上游 401/403 拒绝时自动重签。静态 API Key 账号（ck_/pt_ 前缀）没有 OAuth
+		// 身份签不出来，会自动跳过并回 503。显式 false 可退回「只用手工凭证表」。
+		// 改动需重启生效。
+		ThreeDAutoToken bool `json:"three_d_auto_token"`
 	} `json:"features"`
 
 	Models struct {
@@ -625,6 +690,19 @@ func Default() *Config {
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Features.SanitizeBrandScope = "all"
+	// 6020/6021 排队等待（见 internal/server/handler.go 的 ErrUpstreamBusy 分支）：
+	// 缺省等一轮（60s 上限），避免把上游明说「40 秒后再来」的排队秒变成客户端可见失败。
+	c.Features.BusyRetry = true
+	c.Features.BusyWaitSeconds = 60
+	// 预告式收尾救援缺省开启（issue #245 的长会话断写靠它）；agent 客户端可关（#273）。
+	c.Features.NarrationEnabled = true
+	// 加号绑定号池出口缺省开启：登录也走代理，落盘后钉成该号的固定绑定。
+	// 显式 false 回到「登录直连」，供出口不支持登录域名的部署（如只放行 workbuddy.cn
+	// 的线路登录 codebuddy.ai 站点会 503）按需关掉。
+	c.Features.LoginBindProxy = true
+	// 3D 临时凭证自动签发缺省 true：打开 three_d_enabled 即开箱可用，无须手工收集
+	// ck_t_。显式 false 退回「只用手工凭证表」。
+	c.Features.ThreeDAutoToken = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	// 思考档位策略缺省：网关按模型最高档补缺档请求，但客户端显式档位优先
 	// （client_priority=true），且不覆盖客户端的关闭思考意图（override_scope=level）。
@@ -1007,8 +1085,13 @@ func (c *Config) normalize() error {
 	}
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
-		c.Logging.PanelLogEnabled = true
+	}
+	// 面板日志的回落与请求归档各管各的：request_archive_max_mb<=0 不能顺手把
+	// panel_log_enabled 的显式 false 改回 true（false 是合法取值，不回落）。
+	if c.Logging.PanelLogRetentionDays <= 0 {
 		c.Logging.PanelLogRetentionDays = 7
+	}
+	if c.Logging.PanelLogMaxMB <= 0 {
 		c.Logging.PanelLogMaxMB = 50
 	}
 	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
@@ -1032,6 +1115,14 @@ func (c *Config) normalize() error {
 	}
 	if c.HeadKeepaliveDur < 0 {
 		return fmt.Errorf("server.head_keepalive: 负时长 %q 无意义", c.Server.HeadKeepalive)
+	}
+	// 排队等待上限：0 回落缺省 60s；负数合法（= 不等，直接把排队交给客户端）；
+	// 超过 Retry-After 上报上限（600s）没有意义也无从验证，fail fast。
+	if c.Features.BusyWaitSeconds == 0 {
+		c.Features.BusyWaitSeconds = 60
+	}
+	if c.Features.BusyWaitSeconds > 600 {
+		return fmt.Errorf("features.busy_wait_seconds: %d 超出允许范围 1–600", c.Features.BusyWaitSeconds)
 	}
 	// 优雅关停窗口：空回落 30s（分钟级在途 SSE 远比旧固定 5s 常见）；"0" 合法
 	//（立即退）；负值 fail fast。

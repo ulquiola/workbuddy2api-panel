@@ -23,11 +23,37 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
 )
+
+// estimatedExpiryWarnEvery 同一账号「到期日只能推算」WARN 的最小间隔。余额刷新每 5 分钟
+// 一轮，而这个状态由上游数据形态决定、短时间内不会变；不限频会让每个号每天刷 288 行
+// 同样的日志。变量供测试缩短。
+var estimatedExpiryWarnEvery = time.Hour
+
+var estimatedExpiryWarned sync.Map // uid -> time.Time（上次 WARN 的时刻）
+
+// estimatedExpiryWarnDue 返回该账号这次是否该写 WARN，并记下时刻。
+func estimatedExpiryWarnDue(uid string, now time.Time) bool {
+	// 多个刷新协程可能同时算同一账号：用 LoadOrStore + CompareAndSwap，
+	// 保证同一间隔内只有一个调用方拿到 true。
+	for {
+		v, loaded := estimatedExpiryWarned.LoadOrStore(uid, now)
+		if !loaded {
+			return true
+		}
+		if now.Sub(v.(time.Time)) < estimatedExpiryWarnEvery {
+			return false
+		}
+		if estimatedExpiryWarned.CompareAndSwap(uid, v, now) {
+			return true
+		}
+	}
+}
 
 const (
 	billingSummaryPath = "/billing/meter/get-user-resource-summary"
@@ -98,7 +124,7 @@ type packageDetail struct {
 type summaryReply struct {
 	Packages                []summaryPackage `json:"Packages"`
 	SubscriptionPackageName string           `json:"SubscriptionPackageName"`
-	IsPaidUser              bool             `json:"IsPaidUser"`
+	IsPaidUser              *bool            `json:"IsPaidUser"` // nil = 报文里没有：不知道，不等于免费
 }
 
 type packagesReply struct {

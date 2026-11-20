@@ -3,15 +3,19 @@
 // 非对话端点，与 images 同一套取号与失败处置：单次取号、失败换号上限 3、
 // 请求级错误（参数/内容/模型）fail-fast 不烧全池。回程默认把上游原文原样写出
 // （{query,type,provider,results,total_results,response_time_ms}），不做二次包装；
-// 仅当请求来自 DSH（UA 含 deepseek-harness）时，额外补成 DeepSeek Search API
-// 需要的形状：date:null / title/snippet 字符串、空 url 的卡片改写为等价检索链接，
-// 并接受 count 作为条数。
+// 仅当请求「要 DeepSeek 形状」时——DSH（UA 含 deepseek-harness）或别名路径
+// /v1/tools/search——额外补成 DeepSeek Search API 需要的形状：date:null /
+// title/snippet 字符串、空 url 的卡片改写为等价检索链接，并接受 count 作为条数。
+// 判定的理由见 isDeepSeekToolsPath：路径本身就是形状声明，UA 只是老路径的识别手段。
 //
 // 选号域：请求可带 "model":"cn:x" 只用其 realm 前缀，或直接 "realm":"global"；都没有 → cn。
 //
-//	POST /v1/search
+//	POST /v1/search        或  POST /v1/tools/search（DeepSeek 官方形状的别名）
 //	{"query": "玉林 电梯 维保 新规", "max_results": 5}
 //	{"query": "...", "deep": true}   ← 综述式（agentic_search），单次 40~66s
+//
+// DeepSeek 官方的 need_content / ori_question / localization 有意忽略（不报错、
+// 不生效），理由见 compatDeepSeekSearch 的注释。
 package server
 
 import (
@@ -22,6 +26,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
@@ -58,6 +63,19 @@ func deepSeekSearchClient(ua string) bool {
 	return strings.Contains(strings.ToLower(ua), "deepseek-harness")
 }
 
+// isDeepSeekToolsPath DeepSeek 官方形状的别名路径（/v1/tools/search、/v1/tools/fetch）。
+//
+// 用这个路径的调用方，按定义就是「要 DeepSeek 形状」的那批：他们照官方文档填 base、
+// 按官方 schema 解析，能不能用不该取决于一个与协议无关的 header。UA 在真实世界里
+// 不可靠——HTTP 代理会改写它、自研脚本不设它、各家 SDK 的 UA 五花八门
+// （OpenAI/Python、python-requests、curl…），按 UA 判定会让别名时灵时不灵。
+//
+// 反过来，把兼容层挂到路径上不会伤到任何既有调用方：/v1/search 的 UA 门控一字未改，
+// 非 DSH 客户端打老路径仍然逐字节透传。
+func isDeepSeekToolsPath(p string) bool {
+	return p == "/v1/tools/search" || p == "/v1/tools/fetch"
+}
+
 // cardSearchBase 卡片改写落点。
 //
 // 上游 /agenttool/v1/search 会把「网页」和「结构化卡片」混在同一个 results 里：卡片
@@ -74,13 +92,20 @@ var cardSearchBase = "https://cn.bing.com/search?q="
 //
 // 三件事：
 //  1. 空 url 的条目按上游卡片处理，改写成一次同词检索的链接（见 cardSearchBase）；
-//     query 与 title 皆空、无从取词的才丢弃，并同步修正 total_results。
+//     同一响应里多张卡片的链接必须互不相同（追加 #card-N），否则会被客户端按 url
+//     去重掉；query 与 title 皆空、无从取词的才丢弃，并把 total_results 扣去丢弃数。
 //  2. results[] 里缺 date 时补 `null`。上游（WorkBuddy /agenttool）不返回发布日期，
 //     而 DSH 用 `item.date !== null && typeof item.date !== 'string'` 判定，字段
 //     **缺失**（undefined）会直接抛 invalidResponse（"invalid response body"）。
 //  3. title/snippet 缺失或为 null 时补空串：DSH 要求是 string，空串合法。
 //
-// 调用方只在 deepSeekSearchClient(UA) 为真时走到这里；其余客户端逐字节透传。
+// 调用方只在 deepSeekSearchClient(UA) 或 isDeepSeekToolsPath(路径) 为真时走到这里；
+// 其余客户端逐字节透传。
+//
+// 官方的 need_content / ori_question / localization 三个字段有意不接：上游 agenttool
+// 的 snippet 接口没有正文开关（同 allowed_domains / freshness，见
+// internal/upstream/search.go 的实测边界），传了也无处可用，故静默丢弃、由 README
+// 说明；要整页正文走 deep:true（agentic_search，实测 40~66s）。
 func compatDeepSeekSearch(raw []byte) []byte {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil {
@@ -95,26 +120,39 @@ func compatDeepSeekSearch(raw []byte) []byte {
 		return raw
 	}
 
-	// 卡片改写的取词：优先本次检索词（上游响应自带 query），空则退回卡片标题。
-	// 用检索词而不是标题：卡片的 title 常是表头（如「港股行情指标(货币-港元) |
-	// A股行情指标(货币-人民币)」），拿去搜没有意义；检索词才是用户真正想找的东西。
+	// 本次检索词：上游响应自带 query，是卡片改写的首选取词（见 cardTerm）。
 	var query string
 	if q, has := obj["query"]; has {
 		_ = json.Unmarshal(q, &query)
 	}
 	query = strings.TrimSpace(query)
 
+	// 多张卡片时给每条占位链接加不同的 fragment：客户端（实测 dsh-free-search）按 url
+	// 去重，两张卡片共用一个「检索链接」会被当成重复条目，后一条直接消失——内容其实
+	// 都在，只是链接相同。fragment 不改检索词、也不影响点开看到的结果，而客户端的 URL
+	// 归一化保留 hash（dsh-free-search 的 normalizeUrlForDedupe 保留 u.hash），去重因此
+	// 不再把它们合并。只有一张卡片时不加，链接保持干净。
+	cards := 0
+	for _, it := range items {
+		if strings.TrimSpace(jsonString(it, "url")) == "" && cardTerm(it, query) != "" {
+			cards++
+		}
+	}
+
 	kept := items[:0]
+	cardNo := 0
 	for _, it := range items {
 		if strings.TrimSpace(jsonString(it, "url")) == "" {
-			term := query
-			if term == "" {
-				term = strings.TrimSpace(jsonString(it, "title"))
-			}
+			term := cardTerm(it, query)
 			if term == "" {
 				continue // 无取词可改写：发非法条目比丢掉更糟
 			}
-			patch, err := json.Marshal(cardSearchBase + url.QueryEscape(term))
+			cardNo++
+			target := cardSearchBase + url.QueryEscape(term)
+			if cards > 1 {
+				target += "#card-" + strconv.Itoa(cardNo)
+			}
+			patch, err := json.Marshal(target)
 			if err != nil {
 				continue
 			}
@@ -130,9 +168,15 @@ func compatDeepSeekSearch(raw []byte) []byte {
 		kept = append(kept, it)
 	}
 	if len(kept) != len(items) {
-		// 有条目被丢弃：total_results 跟着修正，避免「说 8 条只回 7 条」。
-		if n, err := json.Marshal(len(kept)); err == nil {
-			obj["total_results"] = n
+		// 有条目被丢弃：total_results 只扣掉丢弃数，而不是覆盖成 len(kept)——
+		// 上游的它是命中总数（实测可大于本页条数，如 results 1 条而 total_results 5），
+		// 覆盖会把「共 5 条」谎报成「共 1 条」。下限取 len(kept)，避免「说 7 条回 8 条」。
+		var total int
+		if raw, has := obj["total_results"]; has && json.Unmarshal(raw, &total) == nil {
+			total = max(total-(len(items)-len(kept)), len(kept))
+			if n, err := json.Marshal(total); err == nil {
+				obj["total_results"] = n
+			}
 		}
 	}
 	patchedResults, err := json.Marshal(kept)
@@ -145,6 +189,16 @@ func compatDeepSeekSearch(raw []byte) []byte {
 		return raw
 	}
 	return out
+}
+
+// cardTerm 卡片改写的取词：优先本次检索词（上游响应自带 query），空则退回卡片标题。
+// 用检索词而不是标题：卡片的 title 常是表头（如「港股行情指标(货币-港元) |
+// A股行情指标(货币-人民币)」），拿去搜没有意义；检索词才是用户真正想找的东西。
+func cardTerm(item map[string]json.RawMessage, query string) string {
+	if query != "" {
+		return query
+	}
+	return strings.TrimSpace(jsonString(item, "title"))
 }
 
 // jsonString 取字符串字段；缺失、null 或类型不符一律按空串处理。
@@ -193,10 +247,11 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 		realm = "cn"
 	}
 
-	// DeepSeek Search API 兼容层只服务 DSH：按 UA 判定。其余客户端保持上游原文
-	// 逐字节透传、条数只认 max_results（行为与兼容层加入前完全一致）。
+	// DeepSeek Search API 兼容层只服务「要 DeepSeek 形状」的请求：DSH 按 UA 判定，
+	// 别名路径（/v1/tools/search）按路径判定。其余客户端保持上游原文逐字节透传、
+	// 条数只认 max_results（行为与兼容层加入前完全一致）。
 	// 兼容层内含「空 url 卡片 → 等价检索链接」的改写，见 compatDeepSeekSearch。
-	dshClient := deepSeekSearchClient(r.UserAgent())
+	dshClient := deepSeekSearchClient(r.UserAgent()) || isDeepSeekToolsPath(r.URL.Path)
 
 	tried := map[string]bool{}
 	// 条数：优先 max_results；DSH 的 deepseek-search-api 只发 count，回落它

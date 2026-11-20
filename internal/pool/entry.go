@@ -73,8 +73,7 @@ type ExpiryBucket struct {
 	Date     string    `json:"date"`
 	ExpireAt time.Time `json:"expires_at,omitempty"`
 	Remain   int64     `json:"remain"`
-	// Estimated 该日至少有一批的到期日按计量周期推算（非上游真实扣费截止），
-	// 面板据此标注「按计量周期推算」（issue #200）。
+	// Estimated 与 upstream.ExpiryBucket.Estimated 同义：该日到期日是按计量周期推算的，面板据此标注。
 	Estimated bool `json:"estimated,omitempty"`
 }
 
@@ -87,6 +86,12 @@ type Status struct {
 	Alias        string `json:"alias,omitempty"`
 	Credits      int64  `json:"credits"`
 	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	// CreditsRaw 禁用前最后一次成功刷新的真实快照（**不是可用量**）。
+	//
+	// 为什么两个字段并存（20261116）：调度器的轮换用法要据此判断「下一个该启用谁」，
+	// 所以真实值必须保留；但 /status 的 credits 语义是「当前可用量」，禁用号必须报 0
+	// —— 否则面板顶部的积分总计会把死钱算进可用额度。两者都要，故分开。
+	CreditsRaw int64 `json:"credits_raw,omitempty"`
 	// ReserveBlocked 是否因「保留积分」停牌（余额已知且 <= 阈值）：账号仍在池中、
 	// 照常跑定时任务，只是不接单。阈值 0 / 余额未知 → false。
 	ReserveBlocked bool `json:"reserve_blocked,omitempty"`
@@ -278,6 +283,13 @@ type entry struct {
 	// alias 本地备注名（面板就地编辑）。与 auth.Nickname 独立：昵称同步只改
 	// nickname，不会覆盖 alias；持久化在 state.json（stateAccount.Alias）。
 	alias string
+	// 模型规则（面板「模型规则」页）：一批模型的黑/白名单，挂到账号上即刻影响选号。
+	// ruleIDs 是持久化的引用（落 state.json）；*Deny/*Allow 是 recomputeRulesLocked
+	// 从规则本体展开的运行态集合，读时无需再查规则表。
+	ruleIDs      []string
+	ruleDeny     map[string]struct{}
+	ruleAllow    map[string]struct{}
+	ruleHasAllow bool
 	// disabledAt 禁用时刻（零值 = 未禁用）。与 reason 配对：运维需要知道
 	// 「什么时候被禁的」——同样一句 401，是刚刚发生还是挂了一周，处置完全不同。
 	disabledAt time.Time
@@ -474,6 +486,11 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	if e.modelOffed(reqModel) {
 		return false
 	}
+	// 模型规则（黑/白名单）：与手动单点开关取并集，同样是「运维意图优先于自动冷却」。
+	// 放这里而不是 filteredLocked：选号按账号逐个判可用性，规则要影响的就是这一层。
+	if e.blockedByRules(reqModel) {
+		return false
+	}
 	if e.modelCooled(now, reqModel) {
 		// 该模型在 6004 独立冷却中 → 不可选。
 		return false
@@ -564,7 +581,9 @@ type stateAccount struct {
 	Disabled         bool    `json:"disabled"`
 	Paused           bool    `json:"paused,omitempty"`
 	Group            string  `json:"group,omitempty"`
-	Reason           string  `json:"reason,omitempty"`
+	// ModelRules 该账号挂的模型规则 id（持久化；规则本体在 stateFile.ModelRules）。
+	ModelRules []string `json:"model_rules,omitempty"`
+	Reason     string   `json:"reason,omitempty"`
 	// Alias 本地备注名（面板就地编辑；与上游 nickname 独立，昵称同步不覆盖）。
 	Alias        string    `json:"alias,omitempty"`
 	DisabledAt   time.Time `json:"disabled_at,omitempty"` // 禁用时刻（持久化：重启后仍能看出禁了多久）
@@ -655,6 +674,12 @@ type stateModelCost struct {
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]stateAccount `json:"accounts"`
+	// ModelRules 模型规则表。与账号的 model_rules 引用分开存：规则可被多账号共用，
+	// 改一次所有挂它的账号立刻生效（不想让改规则变成逐账号的批量写）。
+	ModelRules []ModelRule `json:"model_rules,omitempty"`
+	// Parked 被账号目录热重载暂存的号（pool.go parked）。与 accounts 分开：它们不在池里，
+	// 文件回来时才重新入池，禁用/暂停/分组随之复活。缺省省略，旧文件照常读。
+	Parked map[string]stateAccount `json:"parked_accounts,omitempty"`
 	// Windows 额度窗口登记表（window.go）。放在顶层而不是每个 stateAccount 里：
 	// 它是排程语义（到点发探针），不是账号路由状态，跟着账号走会让「删号重加」
 	// 顺手把窗口也删掉——而额度窗口是上游侧的客观事实，与本地账号记录无关。

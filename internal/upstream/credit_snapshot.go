@@ -148,8 +148,10 @@ func (c *Client) globalCreditSnapshot(a *auth.Auth, soon time.Duration) (CreditS
 	}
 	// 顺手记下这个号是不是付费号：选号对 exclusive 模型（免费号调不通）据此跳过它。
 	// 零额外请求——这个字段本来就在 summary 里，此前只解析不用（上游 #203 / 7a48d72）。
-	if a != nil {
-		c.NotePaidUser(a.UID, sum.IsPaidUser)
+	// 上游把该字段改成指针：nil = 报文里没有，是「不知道」而不是「免费」，故只在非
+	// nil 时记录，避免把未知号误标成免费号、被 exclusive 模型永久跳过。
+	if a != nil && sum.IsPaidUser != nil {
+		c.NotePaidUser(a.UID, *sum.IsPaidUser)
 	}
 	now := time.Now()
 	var remain, total int64
@@ -199,7 +201,9 @@ func (c *Client) globalCreditSnapshot(a *auth.Auth, soon time.Duration) (CreditS
 			}
 		}
 	}
-	if estimated > 0 {
+	if estimated > 0 && a != nil && estimatedExpiryWarnDue(a.UID, now) {
+		// 同一账号按 estimatedExpiryWarnEvery 限频：余额刷新每 5 分钟一轮，而这个状态
+		// 由上游数据形态决定、短期内不会变，不限频会每天刷几百行同样日志。
 		log.Printf("WARN: [billing] %d 个积分类的到期日只能按计量周期（CycleEndTime）推算（acct=%s）",
 			estimated, logfmt.Label(a.UID, a.Nickname))
 	}

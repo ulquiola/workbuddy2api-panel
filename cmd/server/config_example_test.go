@@ -39,6 +39,31 @@ func TestConfigExampleIsValid(t *testing.T) {
 	// models.allowed（issue #68）：示例必须是存在的数组（仿上方各项的「示例可见」
 	// 口径）。空数组解析为非 nil 空切片；nil = 键缺失，用户无从发现白名单配置。
 	if c.Models.Allowed == nil {
-		t.Error("models.allowed 示例应存在（空数组即可），否则用户不知道有白名单开关")
+		t.Error("models.allowed 示例应存在（空数组即可），否则用户不知道有白名单")
+	}
+	// 6020/6021 排队等待的默认值也要在示例里可见（PR #217）。
+	if !c.Features.BusyRetry || c.Features.BusyWaitSeconds != 60 {
+		t.Errorf("features.busy_retry / busy_wait_seconds 示例应为 true / 60: %+v", c.Features)
+	}
+	// 预告式收尾救援默认开（issue #245 靠它），但 agent 客户端可以关（issue #273）——
+	// 示例必须让用户看得到这个开关。
+	if !c.Features.NarrationEnabled {
+		t.Error("features.narration_enabled 示例值应为 true（默认开启）")
+	}
+	// 加号绑定号池出口默认开：示例里必须看得见，否则用户不知道登录本身也走代理池。
+	if !c.Features.LoginBindProxy {
+		t.Error("features.login_bind_proxy 示例值应为 true（默认开启）")
+	}
+	// features.three_d_enabled / three_d_temp_tokens / three_d_auto_token：3D 默认关闭，
+	// 凭证表必须可见（空对象即可），否则用户既不知道有开关、也不知道凭证配在哪；
+	// 自动签发默认 true，示例必须显式体现（缺省行为要让用户看得到）。
+	if c.Features.ThreeDEnabled {
+		t.Error("features.three_d_enabled 示例值应为 false（默认关闭）")
+	}
+	if c.Features.ThreeDTempTokens == nil {
+		t.Error("features.three_d_temp_tokens 示例应存在（空对象即可）")
+	}
+	if !c.Features.ThreeDAutoToken {
+		t.Error("features.three_d_auto_token 示例值应为 true（自动签发默认开启）")
 	}
 }

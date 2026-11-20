@@ -74,6 +74,10 @@ type Config struct {
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
 
+	// RescueToday 今日各类救援次数（narration/toolonly/starved）；nil 时不上报。
+	// 用来把「今天怎么突然多花了钱」变成面板上一眼能看到的数（issue #273）。
+	RescueToday func() map[string]int
+
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
@@ -167,6 +171,14 @@ type Panel struct {
 	// notifier 排程轮次结束后的汇总通知出口（main 装配期注入 alerting webhook；
 	// nil = 只落面板日志）。装配期设定、运行期只读，不需要锁。
 	notifier func(string)
+
+	// campaignMu 活动查询与领奖同一时刻只跑一轮（campaign.go）。
+	campaignMu sync.Mutex
+	// campaignCacheMu/campaignCache 活动进度查询的短时缓存（campaign.go）。
+	campaignCacheMu sync.Mutex
+	campaignCache   campaignCacheEntry
+	// taskLive 实时任务快照与「同一时刻只跑一轮」的闸门（tasklive.go）。
+	taskLive liveCache
 }
 
 // SetGrowthConcurrency 设置排程轮次的账号间并发（1-4；<=0 视为默认 1）。面板保存配置时热改。
@@ -225,6 +237,11 @@ type loginSession struct {
 	// 国际域 codebuddy.ai 与 workbuddy.ai 同后端不同主机，混用会把请求打到非签发域。
 	// 空 = 老会话/未指定，按 cn 处理（siteOrDefault 归一）。
 	site string
+	// proxyID 本次登录出站钉住的号池节点（空 = 直连）。登录开始时选一次、poll 的
+	// 三个端点都用它，账号落盘后再写成该号的固定绑定（见 bindLoginProxy）：加号用的
+	// 出口与之后做任务用的出口必须是同一条，否则「先在这条 IP 上注册、再换一条用」
+	// 本身就是风控眼里的强关联信号，也查不出这号是哪个出口注册的。
+	proxyID string
 	// processing 该 state 正在落盘（含签到/余额校验等副作用）。前端每 3s 轮询，而成功
 	// 分支的副作用可能耗时数秒：没有这个闸门，第二个并发 poll 会把整段流程再跑一遍。
 	processing bool
@@ -276,6 +293,13 @@ func (p *Panel) routes() {
 	// (账号 × 模型) 手动开关：运维显式禁用某账号的某模型（永久语义，仅手动解）。
 	// 与上游触发的临时冷却（6004/11102）正交，且手动优先。
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/model_toggle", p.modelToggle)
+	// 模型规则（面板「模型规则」页）：一批模型的黑/白名单，挂到账号上即刻影响选号。
+	// 与 model_toggle 的手动单点开关并存，两者任一命中都会把该 (账号, 模型) 判为不可用。
+	p.mux.HandleFunc("GET /panel/api/model_rules", p.modelRules)
+	p.mux.HandleFunc("POST /panel/api/model_rules", p.modelRuleSave)
+	p.mux.HandleFunc("POST /panel/api/model_rules/delete", p.modelRuleDelete)
+	p.mux.HandleFunc("POST /panel/api/model_rules/apply", p.modelRuleApply)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/model_rules", p.accountModelRules)
 	// 封禁账号探活：只读探测上游是否已解封，不 revive、不参与选号。
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/probe_ban", p.accountProbeBan)
 	p.mux.HandleFunc("POST /panel/api/login/start", p.loginStart)
@@ -317,6 +341,10 @@ func (p *Panel) routes() {
 	// 只做「读 + 领」——任务本身要客户端真实会话，服务端侧伪造不计数（见 docs/campaign-probe.md）。
 	p.mux.HandleFunc("GET /panel/api/campaign", p.campaignStatus)
 	p.mux.HandleFunc("POST /panel/api/campaign/claim", p.campaignClaim)
+	// 实时任务：直接向每个账号查一次任务表并按 TTL 缓存，供看板定时轮询。
+	// 与 tasks/jobs（后台作业结果）、tasks/scan_all（手动扫描）互补：那两个都要
+	// 有人先动一下，这里不需要。
+	p.mux.HandleFunc("GET /panel/api/tasks/live", p.tasksLive)
 	p.mux.HandleFunc("GET /panel/api/usage", p.usage)
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.usageSave)
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.modelProbes)
@@ -425,6 +453,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"credit_burn_7d": p.creditBurn7d(),
 		// 账号目录热重载（issue #199）：面板显示「上次重载时间/结果摘要」。
 		"reload": p.reloadSnapshot(),
+		// 今日救援次数（issue #273）：每条救援都要多打一次上游、重付整段 prompt。
+		"rescue_today": p.rescueToday(),
 	})
 }
 
@@ -442,6 +472,14 @@ func (p *Panel) creditBurn7d() map[string]usage.CreditBurn {
 	p.burnCache = p.cfg.Usage.CreditByAccountWindow(usage.Window{Hours: 7 * 24})
 	p.burnAt = time.Now()
 	return p.burnCache
+}
+
+// rescueToday 今日各类救援次数；未接回调（或跨天归零后）为空对象。
+func (p *Panel) rescueToday() map[string]int {
+	if p.cfg.RescueToday == nil {
+		return map[string]int{}
+	}
+	return p.cfg.RescueToday()
 }
 
 // reloadSnapshot 热重载状态（面板展示用）。无轮询时 interval_sec=0，前端据此
@@ -1485,6 +1523,10 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 // balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），
 // 完成后返回——面板紧接着拉 overview 即是最新值。账号量小（个位数），
 // 同步等待（上限受短 RPC 超时约束）比"触发后盲刷"体验更确定。
+//
+// 日志带调用来源：这条路径**只能**由面板 refresh 按钮触发，运维看到「没人点也刷新了」
+// 时无从判断是谁打的（issue #249），把 RemoteAddr/UA 打出来即可区分浏览器误触、
+// 开着旧标签页的机器、或持有面板 key 的脚本。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	if !p.tryStartBatch(w, "全量余额刷新") {
 		return
@@ -1496,7 +1538,7 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cfg.Scheduler.RunBalanceRefreshNow()
 	p.syncNicknames()
-	log.Printf("panel: 手动全量余额刷新完成")
+	log.Printf("panel: 手动全量余额刷新完成 src=%s ua=%q", r.RemoteAddr, r.UserAgent())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
 }
 

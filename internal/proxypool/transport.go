@@ -252,6 +252,16 @@ func (m *Manager) Do(client *http.Client, req *http.Request, uid, realm string) 
 	if !proxied {
 		return client.Do(req)
 	}
+	return doVia(client, req, n, tr)
+}
+
+// doVia 把一次请求塞进某个节点的传输层，并把传输层失败翻译成不带凭据的 *Error。
+//
+// 抽出来是因为出口选择有两种入口：Do 按 uid/realm 查绑定表（有关卡的常规出站），
+// DoPinned 直接钉节点（还没有账号的登录/注册）。两条路在「选定之后」的行为必须
+// 逐字一致——错误归类、空闲连接清理、407 判定漏一处，现象就是「经代理的任务偶尔
+// 失败但不留痕」。
+func doVia(client *http.Client, req *http.Request, n node, tr *http.Transport) (*http.Response, error) {
 	selected := *client
 	selected.Transport = tr
 	resp, err := selected.Do(req)
@@ -340,6 +350,7 @@ func (m *Manager) Probe(ctx context.Context, id string) error {
 		return err
 	}
 	version, settings := m.generation[id], m.data.Settings
+	lookupExit := m.exitDueLocked(id, time.Now())
 	m.checking[id] = true
 	delete(m.requested, id)
 	h := m.health[id]
@@ -371,8 +382,8 @@ func (m *Manager) Probe(ctx context.Context, id string) error {
 	elapsed := time.Since(start)
 	// 出口画像顺手刷新（过期才查，见 intel.go）：还没打开、或这次探测本身就失败，都不查。
 	var intel ExitInfo
-	if fn := m.exitLookup(); message == "" && fn != nil && m.exitStale(id, time.Now()) {
-		intel = fn(ctx)
+	if lookupExit && message == "" {
+		intel = fetchExitInfo(ctx, tr) // 经该节点自己的 transport：查到的才是这个节点的出口
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
