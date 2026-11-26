@@ -59,6 +59,11 @@ func TestClassify(t *testing.T) {
 		// 11129 工具定义不合规：确定性请求级错误，分类后不轮转、不罚号。
 		{400, `{"code":11129,"msg":"invalid function call parameters"}`, ErrBadParams},
 		{400, `invalid function call parameters`, ErrBadParams},
+		// 11353（TEI 嵌入后端 413，上游套 500 外壳）：输入过大是请求内容的问题，
+		// 同一 body 换任何账号都是同一句 → 请求级 fail-fast（issue #290）。
+		{500, `{"code":11353,"msg":"Generate embedding failed with error: 11353:generate bemdding by tei failed with status code: [413]"}`, ErrBadParams},
+		// 不带 [413] 的 11353 是 TEI 自身故障，仍按 5xx 处理。
+		{500, `{"code":11353,"msg":"generate embedding by tei failed"}`, ErrServer},
 		{400, `{"extError":{"code":"invalid_function_parameters"}}`, ErrBadParams},
 		// 图片格式/数据错误是确定性请求错误，分类后不轮转、不罚号。
 		{400, `{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string into Go value of type v2.ImageContent"}`, ErrImageInvalid},
@@ -87,10 +92,11 @@ func TestClassify(t *testing.T) {
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
-		// 11102「该后端无此模型」：确定性答复，归 ErrModelBlocked（(账号,模型) 负缓存避让）。
-		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
-		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
-		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11102「该模型 id 上游不存在」：模型级确定性答复（换遍全池同一句）→ 请求级
+		// ErrModelMissing：不轮转、不罚号（issue #280 实测三号一字不差）。
+		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelMissing},
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelMissing},
+		{400, `{"msg":"service info not found"}`, ErrModelMissing},
 		// 11158 是账号类型级模型权限拒绝：同一模型换有权限的账号仍可能成功，
 		// 按 (账号, 模型) 避让；不能落入 ErrClient 轮转后误报 503。
 		{400, `{"code":11158,"msg":"model [gpt-5.6-sol] is not allowed for user type [personal_free_user]"}`, ErrModelBlocked},

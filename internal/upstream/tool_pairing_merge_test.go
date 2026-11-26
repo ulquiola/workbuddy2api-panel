@@ -73,10 +73,15 @@ func TestMergeAdjacentToolCalls(t *testing.T) {
 		t.Fatal("非相邻消息不应合并")
 	}
 
-	// 后一条 content 非空：无法无损拼接，不合并。
+	// 后一条 content 非空：hub #26 口径——相邻第二批是同一轮，正文拼接后并批
+	// （不并的话前一批会变成「无结果调用」，上游 11148）。
 	in3 := mergeMsgs(t, `[`+a00+`,{"role":"assistant","content":"text","tool_calls":[{"id":"c01"}]}]`)
-	if _, changed3 := mergeAdjacentToolCalls(in3); changed3 {
-		t.Fatal("后一条有正文时不应合并")
+	out3, changed3 := mergeAdjacentToolCalls(in3)
+	if !changed3 || len(out3) != 1 {
+		t.Fatalf("后一条有正文时应并批: changed=%v len=%d", changed3, len(out3))
+	}
+	if first, _ := out3[0].(map[string]any); first["content"] != "text" {
+		t.Fatalf("正文应保留: content=%#v", first["content"])
 	}
 
 	// content:[] 也按空正文处理。

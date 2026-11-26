@@ -160,22 +160,23 @@ func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][
 	// 历史裁剪先于 tool 配对：cut 落在整轮边界上，不会切出半个 tool 配对；
 	// 万一客户端自己的历史本来就断了，后面的配对步骤照样兜底。
 	trimHistory(obj, keepRounds)
-	// tool 配对四步（见 tool_pairing.go）：先修顺序倒置、再合并背靠背声明、再重排、最后清孤儿。
+// tool 配对四步（见 tool_pairing.go）：先并相邻调用批，再重排早到结果，再重排插入物，最后清孤儿。
 	// 所有模型一律执行（独立于 deepseek-only 的 sanitize 开关）。这是「让请求通过」的
 	// 安全网——不完整配对的 tool_calls/tool 结果会让上游对之后每条消息都返 400，
 	// 必须先行剔除；插在结果中间的非 tool 消息（Codex image_resize_notice）同样判
 	// 配对断裂，先 repack 挪后，再 cleanup 删孤儿，两侧同口径。
 	//
-	// 顺序有两处不能换：
-	//   - reorderEarly 排最前：它只处理「结果早于调用」这一种顺序倒置，倒置没修时
-	//     repack 会把那条早到的 tool 当成普通消息原样留在原地（role != assistant → 直通），
-	//     后面 cleanup 又因两侧 id 都在而判定「配对完整」，倒置就一路带到上游撞 11148。
-	//   - mergeAdjacent 紧跟其后、先于 repack：它把「背靠背的两条 assistant.tool_calls」
-	//     合成一条（部分 agent 客户端回放并行调用的报文形状），是 11148 的正面修复；
-	//     先合并再 repack，repack 才看得到完整的一批调用。
+	// 顺序不能换：
+	//   - mergeAdjacent 排最前：相邻两批 tool_calls（中间夹正文）在 wire 上是同一轮，
+	//     不先并批，reorderEarly / repack 都把它当两条独立 assistant 原样放过，
+	//     前一批就成了「无结果调用」。
+	//   - reorderEarly 紧随其后、先于 repack：它只处理「结果早于调用」这一种顺序倒置，
+	//     倒置没修时 repack 会把那条早到的 tool 当成普通消息原样留在原地（role !=
+	//     assistant → 直通），后面 cleanup 又因两侧 id 都在而判定「配对完整」，倒置
+	//     就一路带到上游撞 11148。
 	if msgs, ok := obj["messages"].([]any); ok {
-		msgs, _ = reorderEarlyToolResults(msgs)
 		msgs, _ = mergeAdjacentToolCalls(msgs)
+		msgs, _ = reorderEarlyToolResults(msgs)
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
 		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
