@@ -1,4 +1,9 @@
-FROM golang:1.26.10-alpine AS build
+# 构建阶段固定在构建机架构（native），用 GOARCH=$TARGETARCH 交叉编译：多架构构建
+# 不必在 QEMU 里跑 Go 工具链。qemu-user 下 go1.26 的运行时会在并发下载/GC 时随机
+# fatal error: found pointer to free object，整个 build 直接失败（CGO_ENABLED=0 时
+# 交叉编译结果与原生编译等价）。
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine AS build
+ARG TARGETARCH
 # Go module 代理：默认官方源（境外/CI 不多绕一跳）；境内或镜像环境用
 # --build-arg 覆盖，容器内直连 proxy.golang.org 在境内会长时间卡住：
 #   docker compose build --build-arg GOPROXY=https://goproxy.cn,direct
@@ -12,10 +17,10 @@ RUN go mod download
 COPY . .
 ARG APP_VERSION=dev
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.appVersion=${APP_VERSION}" -o /out/wb2api ./cmd/server \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w -X main.appVersion=${APP_VERSION}" -o /out/wb2api ./cmd/server \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
